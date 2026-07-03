@@ -1,0 +1,5 @@
+# 3-node RaftKV cluster (tolerates 1 node failure).
+#
+# Placeholder — populated in Phase 6 once the gRPC transport and server wiring
+# exist. Will define raft0/raft1/raft2 services on a shared network, each with
+# its own data volume, plus Prometheus + Grafana for observability.

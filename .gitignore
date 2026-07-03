@@ -1,0 +1,20 @@
+# Build output
+/bin/
+/out/
+*.exe
+
+# Raft data dirs / bbolt files (persisted logs + snapshots)
+/data/
+*.db
+*.bolt
+
+# Test / coverage
+*.test
+coverage.out
+*.prof
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
