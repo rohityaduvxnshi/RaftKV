@@ -16,8 +16,8 @@ linearizable reads, and idempotent client sessions. It follows Ongaro &
 Ousterhout's Raft paper **Figure 2** exactly; deliberate deviations are recorded
 in §3.
 
-**Current phase.** Phase 0 complete (scaffolding + toolchain). Next: Phase 1
-(leader election).
+**Current phase.** Phase 1 complete (leader election). Next: Phase 2 (log
+replication + KV state machine).
 
 **High-level architecture (grown per phase):**
 
@@ -70,6 +70,36 @@ just by swapping implementations.
 
 Entries map 1:1 to git tags.
 
+### v0.2 — Phase 1: leader election (2026-07-04)
+
+**Added:**
+- Raft core (`internal/raft/raft.go`, `rpc.go`): Follower/Candidate/Leader state
+  machine, persistent term+vote (`SaveHardState` on every change), randomized
+  150–300 ms election timeouts, `RequestVote` (with the §5.4.1 up-to-date check,
+  ready for real logs), heartbeats via empty `AppendEntries`. A single
+  background loop handles both election timeouts and leader heartbeats (avoids
+  dynamic `WaitGroup.Add` races). Figure-2 "step down on higher term" applied at
+  every term observation, inbound and on RPC replies.
+- Seeded fault model in `internal/transport/inmem`: ~10% drop + 0–27 ms delay
+  (→ reorder) + partition (`SetConnected`), plus gob-cloning of every RPC to
+  model wire serialization (no sender/receiver memory sharing).
+- Test harness (`test/harness_test.go`) + election tests (`test/election_test.go`):
+  `checkOneLeader` asserts **Election Safety** (no two leaders per term),
+  `checkTerms` asserts term agreement, plus stability/rejoin guards.
+
+**Acceptance result (Windows dev box, Go 1.26.4 + mingw-w64 for -race):**
+- Exactly one leader at **N=3** (`TestInitialElection`) and **N=5**
+  (`TestElection5Nodes`).
+- Leader isolated → new leader in a **higher term**; old leader rejoining does
+  not create a second leader; a **minority cannot elect**; quorum restored →
+  elects again (`TestReElection`). Election Safety asserted throughout.
+- **Single stable leader under a lossy network** (`TestElectionUnreliable`,
+  5 nodes, ~10% drop + delays), bounded term growth over a 900 ms window.
+- Term propagation (`TestTermAgreement`); clean partition-heal
+  (`TestNoChurnOnRejoin`).
+- `go test -race ./...` green; **5× repeat, no flakiness**; `go vet` + `gofmt`
+  clean. Reviewed by a 4-lens adversarial workflow (see §3).
+
 ### v0.1 — Phase 0: scaffolding & tooling (2026-07-03)
 
 **Added:**
@@ -96,11 +126,30 @@ Entries map 1:1 to git tags.
   *functional* against a deliberate data-race probe before trusting it.
 - `go vet ./...` → exit 0; `gofmt -l .` → clean.
 - Interfaces compile; `CLAUDE.md` present with all five sections.
-- CI: to be confirmed green on first push.
+- CI: confirmed green on first push (both `main` and the `v0.1` tag).
 
 ---
 
 ## 3. Changes (running changelog, incl. reversals & what didn't work)
+
+- **2026-07-04 — Adversarial review of Phase 1 found a real timer-reset bug.**
+  A 4-lens review workflow (Raft correctness / concurrency / liveness / test
+  rigor, each finding independently verified) flagged that `stepDownIfBehind`
+  converted to follower **without resetting the election timer**. A leader's
+  `electionDeadline` is always stale (the leader loop never refreshes it), so a
+  leader learning of a higher term via an RPC *reply* would re-campaign on the
+  next ~12 ms tick. **Fixed** by resetting the timer inside `stepDownIfBehind`
+  (the shared choke point). **Honest caveat:** the bug does **not** manifest in
+  any Phase-1 black-box test — the rejoining higher-term node's inbound
+  `RequestVote` almost always resets the timer first, masking the reply path
+  (verified empirically: term growth was 0 with and without the fix). The fix is
+  still correct Raft and matters once later phases add real logs/commit. A
+  razor-sharp deterministic reproduction would need a virtual clock (deferred).
+  The review also added two missing tests (term agreement, stability under loss)
+  and correctly rejected three out-of-scope/nit findings.
+- **2026-07-04 — Phase 0 CI confirmed green.** First push ran the CI workflow on
+  both `main` and the `v0.1` tag → both `conclusion: success` (closes the open
+  Phase-0 acceptance item).
 
 - **2026-07-03 — Toolchain bootstrap on a bare Windows box.** No Go/gcc/make
   present. Installed Go 1.26.4 as a *portable zip* to
@@ -151,11 +200,14 @@ exactly what is live vs. local when it lands.
 
 ## 5. Known issues / next
 
-- **Next:** Phase 1 — leader election (Follower/Candidate/Leader state machine,
-  persistent term+vote, randomized 150–300 ms election timeouts, `RequestVote`,
-  heartbeats via empty `AppendEntries`), plus the seeded fault model
-  (drop/reorder/delay/partition) in the in-mem transport and Election-Safety
-  assertions.
-- CI not yet observed green (no push since scaffolding) — confirm on first push.
-- `internal/transport/inmem` currently delivers synchronously/reliably; the
-  adversarial fault model is added in Phase 1.
+- **Next:** Phase 2 — log replication + KV state machine. `AppendEntries` with
+  the log-matching consistency check and fast conflict backup (the
+  `ConflictTerm`/`ConflictIndex` reply fields already exist), commit-index
+  advancement on quorum, an ordered apply loop, and the KV state machine
+  (`Get`/`Put`/`Delete`/`CAS`). Assert Log Matching + State Machine Safety.
+- **Deferred (noted, not blocking):** outbound RPC goroutines are fire-and-forget
+  with `context.Background()`; harmless in Phase 1 (single-shot, mutex-guarded),
+  but Phase 2+ should thread a context and/or bound them once they touch
+  shared/observable state. A virtual clock (for bit-deterministic timing tests)
+  is also deferred — current tests assert properties over time windows.
+- CI green (Phase 0). Race detector requires the 64-bit `CC` on Windows (§4).

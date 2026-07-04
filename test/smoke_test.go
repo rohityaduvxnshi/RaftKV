@@ -36,8 +36,9 @@ func (h *echoHandler) HandleInstallSnapshot(a *raft.InstallSnapshotArgs) *raft.I
 // TestInmemRoundTrip verifies a registered peer answers, an unregistered peer is
 // unreachable, and concurrent sends are race-free (this test must pass -race).
 func TestInmemRoundTrip(t *testing.T) {
-	net := inmem.NewNetwork()
+	net := inmem.NewNetwork(1)
 	h := &echoHandler{}
+	net.Register(0, &echoHandler{}) // sender must be connected in the fault-model network
 	net.Register(1, h)
 	tr := net.Transport(0)
 	ctx := context.Background()
