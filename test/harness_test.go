@@ -1,6 +1,8 @@
 package test
 
 import (
+	"bytes"
+	"sync"
 	"testing"
 	"time"
 
@@ -8,8 +10,9 @@ import (
 	"github.com/rohityaduvxnshi/RaftKV/internal/transport/inmem"
 )
 
-// cluster is an N-node Raft test cluster on the simulated in-mem network. All
-// harness methods are called only from the test goroutine.
+// cluster is an N-node Raft test cluster on the simulated in-mem network.
+// GetState/connect/disconnect are called only from the test goroutine; the
+// apply-tracking state (guarded by amu) is written by per-node drain goroutines.
 type cluster struct {
 	t          *testing.T
 	n          int
@@ -17,7 +20,14 @@ type cluster struct {
 	net        *inmem.Network
 	rafts      []*raft.Raft
 	persisters []*raft.MemPersister
+	applyChs   []chan raft.ApplyMsg
 	connected  []bool
+
+	amu       sync.Mutex
+	committed map[uint64][]byte   // index -> the agreed command (State Machine Safety oracle)
+	applied   []map[uint64][]byte // per node: index -> command it applied
+	nextApply []uint64            // per node: next index expected (in-order check)
+	done      chan struct{}
 }
 
 // makeCluster builds and starts an N-node cluster. Pass reliable=false to inject
@@ -34,22 +44,32 @@ func makeCluster(t *testing.T, n int, seed int64, reliable bool) *cluster {
 		net:        inmem.NewNetwork(seed),
 		rafts:      make([]*raft.Raft, n),
 		persisters: make([]*raft.MemPersister, n),
+		applyChs:   make([]chan raft.ApplyMsg, n),
 		connected:  make([]bool, n),
+		committed:  make(map[uint64][]byte),
+		applied:    make([]map[uint64][]byte, n),
+		nextApply:  make([]uint64, n),
+		done:       make(chan struct{}),
 	}
 	c.net.SetReliable(reliable)
 	for i := 0; i < n; i++ {
 		c.persisters[i] = raft.NewMemPersister()
+		c.applyChs[i] = make(chan raft.ApplyMsg, 256)
+		c.applied[i] = make(map[uint64][]byte)
+		c.nextApply[i] = 1 // index 0 is the sentinel, never applied
 		c.rafts[i] = raft.New(raft.Config{
 			ID:        i,
 			Peers:     peers,
 			Transport: c.net.Transport(i),
 			Persister: c.persisters[i],
+			ApplyCh:   c.applyChs[i],
 			Seed:      seed,
 		})
 		c.net.Register(i, c.rafts[i])
 		c.connected[i] = true
 	}
 	for i := 0; i < n; i++ {
+		go c.drain(i, c.applyChs[i])
 		c.rafts[i].Start()
 	}
 	return c
@@ -57,8 +77,92 @@ func makeCluster(t *testing.T, n int, seed int64, reliable bool) *cluster {
 
 func (c *cluster) cleanup() {
 	for _, r := range c.rafts {
-		r.Kill()
+		r.Kill() // stops each applier; safe to do before closing done
 	}
+	close(c.done)
+}
+
+// drain consumes a node's committed entries, asserting State Machine Safety (all
+// nodes apply the same command at each index) and in-order, gap-free apply.
+func (c *cluster) drain(i int, ch chan raft.ApplyMsg) {
+	for {
+		select {
+		case msg := <-ch:
+			c.amu.Lock()
+			if prev, ok := c.committed[msg.Index]; ok {
+				if !bytes.Equal(prev, msg.Command) {
+					c.amu.Unlock()
+					c.t.Errorf("State Machine Safety violated at index %d: node %d applied %q, expected %q",
+						msg.Index, i, msg.Command, prev)
+					continue
+				}
+			} else {
+				c.committed[msg.Index] = append([]byte(nil), msg.Command...)
+			}
+			if msg.Index != c.nextApply[i] {
+				c.t.Errorf("node %d applied index %d out of order (expected %d)", i, msg.Index, c.nextApply[i])
+			}
+			c.nextApply[i] = msg.Index + 1
+			c.applied[i][msg.Index] = append([]byte(nil), msg.Command...)
+			c.amu.Unlock()
+		case <-c.done:
+			return
+		}
+	}
+}
+
+// nCommitted reports how many nodes have applied the entry at index, plus the
+// agreed command there.
+func (c *cluster) nCommitted(index uint64) (int, []byte) {
+	c.amu.Lock()
+	defer c.amu.Unlock()
+	count := 0
+	for i := 0; i < c.n; i++ {
+		if _, ok := c.applied[i][index]; ok {
+			count++
+		}
+	}
+	return count, c.committed[index]
+}
+
+// one submits cmd through the current leader and waits until at least
+// expectedServers nodes have committed it at the same index, returning that
+// index. It retries through leader changes (resubmitting on a different node).
+// It is safe to call from worker goroutines: on failure it records the error
+// with Errorf (not Fatalf) and returns 0, per the testing contract that FailNow
+// run only on the test goroutine.
+func (c *cluster) one(cmd []byte, expectedServers int, retry bool) uint64 {
+	c.t.Helper()
+	t0 := time.Now()
+	for time.Since(t0) < 5*time.Second {
+		index, ok := uint64(0), false
+		for i := 0; i < c.n; i++ {
+			if !c.connected[i] {
+				continue
+			}
+			if idx, _, isLeader := c.rafts[i].Submit(cmd); isLeader {
+				index, ok = idx, true
+				break
+			}
+		}
+		if ok {
+			t1 := time.Now()
+			for time.Since(t1) < 2*time.Second {
+				if cnt, actual := c.nCommitted(index); cnt >= expectedServers && bytes.Equal(actual, cmd) {
+					return index
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			if !retry {
+				c.t.Errorf("one(%q): not committed by %d servers", cmd, expectedServers)
+				return 0
+			}
+		} else {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	c.t.Errorf("one(%q): no agreement within 5s", cmd)
+	return 0
 }
 
 // disconnect / connect partition and heal a node.

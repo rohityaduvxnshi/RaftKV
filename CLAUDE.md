@@ -16,8 +16,8 @@ linearizable reads, and idempotent client sessions. It follows Ongaro &
 Ousterhout's Raft paper **Figure 2** exactly; deliberate deviations are recorded
 in §3.
 
-**Current phase.** Phase 1 complete (leader election). Next: Phase 2 (log
-replication + KV state machine).
+**Current phase.** Phase 2 complete (log replication + KV state machine). Next:
+Phase 3 (persistence & crash recovery).
 
 **High-level architecture (grown per phase):**
 
@@ -69,6 +69,33 @@ just by swapping implementations.
 ## 2. Version history
 
 Entries map 1:1 to git tags.
+
+### v0.3 — Phase 2: log replication + KV state machine (2026-07-04)
+
+**Added:**
+- Replication in `internal/raft`: `Submit` (client append), full
+  `HandleAppendEntries` (log-matching check, truncate-only-on-genuine-conflict
+  splice, fast conflict backup via `ConflictTerm`/`ConflictIndex`),
+  `maybeAdvanceCommit` (quorum + §5.4.2 own-term rule), `nextIndex`/`matchIndex`,
+  and an ordered `applier` loop (sync.Cond) delivering committed entries to an
+  apply channel. Log now carries a sentinel at index 0 so `log[i].Index == i`.
+- `internal/kv`: the replicated KV state machine (`Get`/`Put`/`Delete`/`CAS`,
+  gob-encoded ops). CAS requires the key to exist (etcd-style; documented).
+- Harness upgrades (`test/harness_test.go`): per-node apply drains that assert
+  **State Machine Safety** (no two nodes apply a different command at one index)
+  and in-order, gap-free apply; MIT-style `one()`/`nCommitted()`.
+- Tests (`test/replication_test.go`): basic agreement, agreement with a follower
+  down, leader-change keeps committed, deposed-leader entries overwritten,
+  concurrent writers, KV op semantics, single-node.
+
+**Acceptance result (Windows dev box, Go 1.26.4 + mingw-w64 for -race):**
+- Writes replicate to a majority and apply in the **same order on every node**
+  (Log Matching + State Machine Safety asserted in the drain).
+- Leader change mid-workload loses no committed entry; a deposed leader's
+  **uncommitted entries are overwritten** on rejoin.
+- Concurrent writers stay consistent; `Put`/`CAS`/`Delete` deterministic.
+- `go test -race ./...` green; **2× repeat, no flakiness**; `vet` + `gofmt`
+  clean. 4-lens adversarial review (see §3).
 
 ### v0.2 — Phase 1: leader election (2026-07-04)
 
@@ -132,6 +159,19 @@ Entries map 1:1 to git tags.
 
 ## 3. Changes (running changelog, incl. reversals & what didn't work)
 
+- **2026-07-04 — Adversarial review of Phase 2 + a single-node gap.** The 4-lens
+  review confirmed 1 real finding (N=1 clusters never advanced `commitIndex`,
+  since only a follower's reply drove `maybeAdvanceCommit`) and correctly
+  rejected 3 (a `LeaderCommit` bound that coincides with Figure 2 in Phase 2, a
+  defensible CAS-on-absent contract, a benign `Fatalf`-from-goroutine). Writing
+  the N=1 test surfaced an **even more basic** gap the review missed: a
+  single-node cluster never *won* its election either, because the majority
+  check lived only inside per-peer vote-reply goroutines (none exist at N=1).
+  **Fixed both** (immediate self-win in `startElection`; `maybeAdvanceCommit` in
+  `Submit`). Also proactively made the follower `LeaderCommit` bound
+  Figure-2-exact (min with the last *new* entry's index, not our last index) to
+  kill a latent trap before entry-batching lands, and made the `one()` helper
+  goroutine-safe (`Errorf` not `Fatalf`).
 - **2026-07-04 — Adversarial review of Phase 1 found a real timer-reset bug.**
   A 4-lens review workflow (Raft correctness / concurrency / liveness / test
   rigor, each finding independently verified) flagged that `stepDownIfBehind`
@@ -200,14 +240,16 @@ exactly what is live vs. local when it lands.
 
 ## 5. Known issues / next
 
-- **Next:** Phase 2 — log replication + KV state machine. `AppendEntries` with
-  the log-matching consistency check and fast conflict backup (the
-  `ConflictTerm`/`ConflictIndex` reply fields already exist), commit-index
-  advancement on quorum, an ordered apply loop, and the KV state machine
-  (`Get`/`Put`/`Delete`/`CAS`). Assert Log Matching + State Machine Safety.
+- **Next:** Phase 3 — persistence & crash recovery. Wire the log through the
+  `Persister` (`AppendEntries`/`TruncateSuffix` calls at the existing
+  Phase-3-marked spots in `Submit`/`HandleAppendEntries`), add the bbolt-backed
+  Persister with fsync on the critical path, reconstruct state (incl. the log
+  sentinel) in `New` via `Persister.Load`, and add crash/restart tests.
+- **In-memory only so far (by design):** the log lives only in RAM in Phase 2;
+  `MemPersister` stores just term+vote. Phase 3 makes it durable.
 - **Deferred (noted, not blocking):** outbound RPC goroutines are fire-and-forget
-  with `context.Background()`; harmless in Phase 1 (single-shot, mutex-guarded),
-  but Phase 2+ should thread a context and/or bound them once they touch
-  shared/observable state. A virtual clock (for bit-deterministic timing tests)
-  is also deferred — current tests assert properties over time windows.
-- CI green (Phase 0). Race detector requires the 64-bit `CC` on Windows (§4).
+  with `context.Background()` — fine now (mutex-guarded), but should be bounded
+  once they touch more shared state. A virtual clock (for bit-deterministic
+  timing tests) is also deferred — tests assert properties over time windows.
+- CI green through Phase 1. Race detector requires the 64-bit `CC` on Windows
+  (§4).
