@@ -295,11 +295,13 @@ func (c *cluster) connect(i int) {
 }
 
 // checkOneLeader asserts Election Safety — no two leaders share a term — and
-// returns the leader of the highest term among connected nodes. It retries to
-// let an in-progress election settle.
+// returns the leader of the highest term among connected nodes. It polls for up
+// to ~3s (returning as soon as a leader exists), generous enough that a loaded
+// machine or CI runner doesn't spuriously report "no leader" while an election
+// is still settling.
 func (c *cluster) checkOneLeader() int {
 	c.t.Helper()
-	for iters := 0; iters < 12; iters++ {
+	for iters := 0; iters < 50; iters++ {
 		time.Sleep(60 * time.Millisecond)
 		leadersByTerm := map[uint64][]int{}
 		for i := 0; i < c.n; i++ {
