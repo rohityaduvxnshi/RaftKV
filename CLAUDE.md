@@ -16,8 +16,8 @@ linearizable reads, and idempotent client sessions. It follows Ongaro &
 Ousterhout's Raft paper **Figure 2** exactly; deliberate deviations are recorded
 in §3.
 
-**Current phase.** Phase 2 complete (log replication + KV state machine). Next:
-Phase 3 (persistence & crash recovery).
+**Current phase.** Phase 3 complete (persistence & crash recovery). Next: Phase 4
+(snapshotting / log compaction).
 
 **High-level architecture (grown per phase):**
 
@@ -69,6 +69,29 @@ just by swapping implementations.
 ## 2. Version history
 
 Entries map 1:1 to git tags.
+
+### v0.4 — Phase 3: persistence & crash recovery (2026-07-04)
+
+**Added:**
+- `internal/storage/bolt`: a bbolt-backed `raft.Persister` (buckets for meta /
+  log / snap; big-endian index keys; gob values). bbolt fsyncs on every commit,
+  so `SaveHardState`/`AppendEntries`/`TruncateSuffix` sit on the durability
+  critical path.
+- Raft core wiring: `Submit` and `HandleAppendEntries` persist log mutations
+  before acting/acking; `New` reloads term+vote+log via `Persister.Load`
+  (recovered entries load after the sentinel, keeping `log[i].Index == i`).
+- Harness: pluggable persister factory (in-mem or bbolt), `crashAndRestart`
+  (kill + reopen from disk), and `crashAllAndRestart` (whole-cluster outage).
+- Tests: direct Persister round-trip + truncation; follower / leader /
+  whole-cluster / single-node crash recovery.
+
+**Acceptance result (Windows dev box, Go 1.26.4 + mingw-w64 for -race):**
+- A killed node restarts, recovers its persisted log from disk, and rejoins
+  without violating any invariant; a subsequent write commits on all nodes.
+- Whole-cluster kill + restart: committed data survives entirely from disk and
+  every node replays it (`TestWholeClusterRestart`).
+- `go test -race ./...` green; **2× repeat, no flakiness**; `vet` + `gofmt`
+  clean. 3-lens adversarial review found **no defects**.
 
 ### v0.3 — Phase 2: log replication + KV state machine (2026-07-04)
 
@@ -159,6 +182,17 @@ Entries map 1:1 to git tags.
 
 ## 3. Changes (running changelog, incl. reversals & what didn't work)
 
+- **2026-07-04 — Phase 3 review clean; persist-ordering is the crux.** The 3-lens
+  adversarial review (crash-consistency, bbolt store, recovery/concurrency)
+  found **no defects**. The property that makes separate-transaction persistence
+  crash-safe without atomic multi-key writes: `currentTerm` is always fsync'd
+  (in `stepDownIfBehind`/`startElection`) *before* any log entry of that term is
+  persisted, so a crash between the two transactions can only lose the log
+  append (harmless — the leader resends), never leave `currentTerm` below a log
+  entry's term. **Known trade-off (not a bug):** persist calls run while holding
+  `r.mu`, so a bbolt fsync briefly blocks the node's other handlers — correct,
+  and the price of durability on the critical path; batching/pipelining is a
+  future perf lever, not a correctness need.
 - **2026-07-04 — Adversarial review of Phase 2 + a single-node gap.** The 4-lens
   review confirmed 1 real finding (N=1 clusters never advanced `commitIndex`,
   since only a follower's reply drove `maybeAdvanceCommit`) and correctly
@@ -240,16 +274,20 @@ exactly what is live vs. local when it lands.
 
 ## 5. Known issues / next
 
-- **Next:** Phase 3 — persistence & crash recovery. Wire the log through the
-  `Persister` (`AppendEntries`/`TruncateSuffix` calls at the existing
-  Phase-3-marked spots in `Submit`/`HandleAppendEntries`), add the bbolt-backed
-  Persister with fsync on the critical path, reconstruct state (incl. the log
-  sentinel) in `New` via `Persister.Load`, and add crash/restart tests.
-- **In-memory only so far (by design):** the log lives only in RAM in Phase 2;
-  `MemPersister` stores just term+vote. Phase 3 makes it durable.
+- **Next:** Phase 4 — snapshotting / log compaction. Snapshot the KV state
+  machine at a size/index threshold (`Persister.SaveSnapshot` +
+  `TruncatePrefix` already exist), track a snapshot boundary offset so
+  `log[i].Index == i` becomes `log[i-base].Index == i`, add the
+  `InstallSnapshot` RPC for followers whose needed prefix is compacted, and
+  restore-from-snapshot on restart. Assert the log stays bounded and a lagging
+  follower is caught up via `InstallSnapshot`.
+- **§5.4.2 note (for Phase 5):** after a restart/new election, recovered
+  committed entries re-apply only once a current-term entry commits. Tests cover
+  this with a post-restart write. A no-op-on-election (or the ReadIndex barrier)
+  would make re-application immediate — deferred to Phase 5 (also needed for
+  linearizable reads).
 - **Deferred (noted, not blocking):** outbound RPC goroutines are fire-and-forget
-  with `context.Background()` — fine now (mutex-guarded), but should be bounded
-  once they touch more shared state. A virtual clock (for bit-deterministic
-  timing tests) is also deferred — tests assert properties over time windows.
-- CI green through Phase 1. Race detector requires the 64-bit `CC` on Windows
+  with `context.Background()`; persist-under-lock serializes the node during
+  fsync (perf, not correctness). A virtual clock is also deferred.
+- CI green through Phase 2. Race detector requires the 64-bit `CC` on Windows
   (§4).

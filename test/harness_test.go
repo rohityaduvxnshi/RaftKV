@@ -2,11 +2,14 @@ package test
 
 import (
 	"bytes"
+	"fmt"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/rohityaduvxnshi/RaftKV/internal/raft"
+	"github.com/rohityaduvxnshi/RaftKV/internal/storage/bolt"
 	"github.com/rohityaduvxnshi/RaftKV/internal/transport/inmem"
 )
 
@@ -17,9 +20,11 @@ type cluster struct {
 	t          *testing.T
 	n          int
 	seed       int64
+	peers      []int
 	net        *inmem.Network
 	rafts      []*raft.Raft
-	persisters []*raft.MemPersister
+	persisters []raft.Persister
+	pfactory   func(i int) raft.Persister // returns node i's durable store (same across restarts)
 	applyChs   []chan raft.ApplyMsg
 	connected  []bool
 
@@ -30,9 +35,35 @@ type cluster struct {
 	done      chan struct{}
 }
 
-// makeCluster builds and starts an N-node cluster. Pass reliable=false to inject
-// message drops and delays. Everything is reproducible from seed.
+// makeCluster builds and starts an N-node cluster backed by in-memory
+// persisters. Pass reliable=false to inject message drops and delays. Everything
+// is reproducible from seed.
 func makeCluster(t *testing.T, n int, seed int64, reliable bool) *cluster {
+	mems := make([]*raft.MemPersister, n)
+	factory := func(i int) raft.Persister {
+		if mems[i] == nil {
+			mems[i] = raft.NewMemPersister()
+		}
+		return mems[i] // same object across restarts: state survives
+	}
+	return newCluster(t, n, seed, reliable, factory)
+}
+
+// makeClusterBolt builds an N-node cluster backed by real bbolt files under a
+// temp dir, so crashAndRestart genuinely reloads durable state from disk.
+func makeClusterBolt(t *testing.T, n int, seed int64, reliable bool) *cluster {
+	dir := t.TempDir()
+	factory := func(i int) raft.Persister {
+		p, err := bolt.Open(filepath.Join(dir, fmt.Sprintf("raft-%d.db", i)))
+		if err != nil {
+			t.Fatalf("open bolt for node %d: %v", i, err)
+		}
+		return p // reopening the same file reloads on-disk state
+	}
+	return newCluster(t, n, seed, reliable, factory)
+}
+
+func newCluster(t *testing.T, n int, seed int64, reliable bool, pfactory func(i int) raft.Persister) *cluster {
 	peers := make([]int, n)
 	for i := range peers {
 		peers[i] = i
@@ -41,9 +72,11 @@ func makeCluster(t *testing.T, n int, seed int64, reliable bool) *cluster {
 		t:          t,
 		n:          n,
 		seed:       seed,
+		peers:      peers,
 		net:        inmem.NewNetwork(seed),
 		rafts:      make([]*raft.Raft, n),
-		persisters: make([]*raft.MemPersister, n),
+		persisters: make([]raft.Persister, n),
+		pfactory:   pfactory,
 		applyChs:   make([]chan raft.ApplyMsg, n),
 		connected:  make([]bool, n),
 		committed:  make(map[uint64][]byte),
@@ -53,7 +86,7 @@ func makeCluster(t *testing.T, n int, seed int64, reliable bool) *cluster {
 	}
 	c.net.SetReliable(reliable)
 	for i := 0; i < n; i++ {
-		c.persisters[i] = raft.NewMemPersister()
+		c.persisters[i] = pfactory(i)
 		c.applyChs[i] = make(chan raft.ApplyMsg, 256)
 		c.applied[i] = make(map[uint64][]byte)
 		c.nextApply[i] = 1 // index 0 is the sentinel, never applied
@@ -75,11 +108,63 @@ func makeCluster(t *testing.T, n int, seed int64, reliable bool) *cluster {
 	return c
 }
 
+// bringUp (re)creates node i from its (reopened) persister, restoring its
+// connection state and a fresh apply drain, but does NOT start it. The node
+// replays its committed log from index 1, so its apply tracking is reset.
+func (c *cluster) bringUp(i int) {
+	c.persisters[i] = c.pfactory(i)
+	c.applyChs[i] = make(chan raft.ApplyMsg, 256)
+	c.amu.Lock()
+	c.nextApply[i] = 1
+	c.applied[i] = make(map[uint64][]byte)
+	c.amu.Unlock()
+	c.rafts[i] = raft.New(raft.Config{
+		ID:        i,
+		Peers:     c.peers,
+		Transport: c.net.Transport(i),
+		Persister: c.persisters[i],
+		ApplyCh:   c.applyChs[i],
+		Seed:      c.seed,
+	})
+	c.net.Register(i, c.rafts[i])
+	c.net.SetConnected(i, c.connected[i]) // Register re-connects; restore partition state
+	go c.drain(i, c.applyChs[i])
+}
+
+// crashAndRestart simulates a kill -9 + restart of node i: stop it, close and
+// reopen its persister (reloading durable state from disk for bbolt), and start
+// a fresh Raft that must recover its log and rejoin.
+func (c *cluster) crashAndRestart(i int) {
+	c.rafts[i].Kill()
+	_ = c.persisters[i].Close()
+	c.bringUp(i)
+	c.rafts[i].Start()
+}
+
+// crashAllAndRestart takes the WHOLE cluster down at once, then brings it back —
+// the strongest durability test: nothing is alive to serve the recovered nodes,
+// so committed data must come entirely from disk.
+func (c *cluster) crashAllAndRestart() {
+	for i := 0; i < c.n; i++ {
+		c.rafts[i].Kill()
+		_ = c.persisters[i].Close()
+	}
+	for i := 0; i < c.n; i++ {
+		c.bringUp(i)
+	}
+	for i := 0; i < c.n; i++ {
+		c.rafts[i].Start()
+	}
+}
+
 func (c *cluster) cleanup() {
 	for _, r := range c.rafts {
 		r.Kill() // stops each applier; safe to do before closing done
 	}
 	close(c.done)
+	for _, p := range c.persisters {
+		_ = p.Close()
+	}
 }
 
 // drain consumes a node's committed entries, asserting State Machine Safety (all

@@ -76,11 +76,11 @@ func (r *Raft) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply 
 			if r.log[idx].Term == args.Entries[j].Term {
 				continue // already have this entry
 			}
-			r.log = r.log[:idx] // conflict: drop this and everything after
-			// Phase 3: persister.TruncateSuffix(idx) here.
+			r.log = r.log[:idx]          // conflict: drop this and everything after
+			r.persistTruncateSuffix(idx) // durable before we ack
 		}
 		r.log = append(r.log, args.Entries[j:]...)
-		// Phase 3: persister.AppendEntries(args.Entries[j:]) here.
+		r.persistAppend(args.Entries[j:]) // durable before we ack
 		break
 	}
 

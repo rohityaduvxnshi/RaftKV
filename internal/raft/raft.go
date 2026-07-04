@@ -116,9 +116,38 @@ func New(cfg Config) *Raft {
 		dead:        make(chan struct{}),
 	}
 	r.applyCond = sync.NewCond(&r.mu)
-	// Phase 3 loads persisted state here; for now start empty.
+
+	// Recover any durable state. Log entries load in ascending index order and
+	// sit after the sentinel, preserving log[i].Index == i.
+	ps, err := r.persister.Load()
+	if err != nil {
+		panic("raft: load persisted state: " + err.Error())
+	}
+	if ps.HasState {
+		r.currentTerm = ps.HardState.CurrentTerm
+		r.votedFor = ps.HardState.VotedFor
+	}
+	if len(ps.Entries) > 0 {
+		r.log = append(r.log, ps.Entries...)
+	}
+	// Phase 4 restores the snapshot boundary here.
 	r.resetElectionTimer()
 	return r
+}
+
+// persistAppend / persistTruncateSuffix durably record log mutations before the
+// node acts on them. A durability failure is unrecoverable, so we stop hard.
+// Caller holds mu.
+func (r *Raft) persistAppend(entries []LogEntry) {
+	if err := r.persister.AppendEntries(entries); err != nil {
+		panic("raft: persist append failed: " + err.Error())
+	}
+}
+
+func (r *Raft) persistTruncateSuffix(index uint64) {
+	if err := r.persister.TruncateSuffix(index); err != nil {
+		panic("raft: persist truncate failed: " + err.Error())
+	}
 }
 
 // Start launches the background loops: the election/heartbeat loop always, and
@@ -167,10 +196,11 @@ func (r *Raft) Submit(command []byte) (index uint64, term uint64, isLeader bool)
 		return 0, 0, false
 	}
 	index = r.lastLogIndex() + 1
-	r.log = append(r.log, LogEntry{Term: r.currentTerm, Index: index, Command: append([]byte(nil), command...)})
+	entry := LogEntry{Term: r.currentTerm, Index: index, Command: append([]byte(nil), command...)}
+	r.log = append(r.log, entry)
+	r.persistAppend([]LogEntry{entry}) // durable before it may count toward commit
 	r.matchIndex[r.id] = index
 	r.nextIndex[r.id] = index + 1
-	// Phase 3 persists the new entry here before it may count toward commit.
 	// Advance commit now so a single-node cluster (no followers to reply) still
 	// makes progress; a no-op for larger clusters until replicas ack.
 	r.maybeAdvanceCommit()
