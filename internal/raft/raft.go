@@ -41,12 +41,20 @@ func (r Role) String() string {
 	}
 }
 
-// ApplyMsg is a committed entry delivered, in index order, to the state machine
-// via the apply channel.
+// ApplyMsg is delivered, in order, to the state machine via the apply channel.
+// Exactly one of CommandValid / SnapshotValid is set: a committed command to
+// apply, or a snapshot to install (after a follower catches up via
+// InstallSnapshot, or on restart-from-snapshot).
 type ApplyMsg struct {
-	Index   uint64
-	Term    uint64
-	Command []byte
+	CommandValid bool
+	Command      []byte
+	Index        uint64
+	Term         uint64
+
+	SnapshotValid bool
+	Snapshot      []byte
+	SnapshotIndex uint64
+	SnapshotTerm  uint64
 }
 
 // Config wires up a Raft node. Peers lists every node ID in the cluster,
@@ -56,14 +64,18 @@ type Config struct {
 	Peers     []int
 	Transport Transport
 	Persister Persister
-	ApplyCh   chan ApplyMsg // committed entries are delivered here in order
-	Seed      int64         // per-node RNG seed for election-timeout jitter
+	ApplyCh   chan ApplyMsg
+	Seed      int64
+}
+
+type pendingSnap struct {
+	index uint64
+	term  uint64
+	data  []byte
 }
 
 // Raft is a single node of the cluster. All mutable state is guarded by mu.
-// The one rule that keeps it deadlock-free: outbound RPCs are always sent from
-// goroutines that do NOT hold mu; those goroutines re-acquire mu only to process
-// the reply.
+// Outbound RPCs are always sent from goroutines that do NOT hold mu.
 type Raft struct {
 	mu        sync.Mutex
 	id        int
@@ -71,12 +83,14 @@ type Raft struct {
 	transport Transport
 	persister Persister
 
-	// Persistent state (Figure 2). Durably saved before responding to RPCs.
-	// The log carries a sentinel entry at index 0 ({Term:0,Index:0}) so that
-	// log[i].Index == i and prevLogIndex lookups need no special-casing.
+	// Persistent state (Figure 2). The log carries a boundary sentinel at index
+	// 0: log[0].Index is the last snapshotted index (0 when no snapshot), and
+	// log[i].Index == log[0].Index + i. Absolute index a maps to slice position
+	// a - base(). Entries at or below base() live only in the snapshot.
 	currentTerm uint64
 	votedFor    int
 	log         []LogEntry
+	snapshot    []byte // bytes of the current snapshot (matches log[0])
 
 	// Volatile state on all servers.
 	role        Role
@@ -91,15 +105,16 @@ type Raft struct {
 	electionDeadline time.Time
 	rng              *rand.Rand
 
-	applyCh   chan ApplyMsg
-	applyCond *sync.Cond // signalled when commitIndex advances (or on Kill)
+	applyCh     chan ApplyMsg
+	applyCond   *sync.Cond
+	pendingSnap *pendingSnap // a snapshot the applier must hand to the state machine
 
 	dead chan struct{}
 	wg   sync.WaitGroup
 }
 
-// New constructs a node in the Follower role. It does not start any goroutines;
-// register it with the transport first, then call Start.
+// New constructs a node in the Follower role. Register it with the transport,
+// then call Start.
 func New(cfg Config) *Raft {
 	r := &Raft{
 		id:          cfg.ID,
@@ -109,7 +124,7 @@ func New(cfg Config) *Raft {
 		applyCh:     cfg.ApplyCh,
 		currentTerm: 0,
 		votedFor:    NoVote,
-		log:         []LogEntry{{Term: 0, Index: 0}}, // sentinel
+		log:         []LogEntry{{Term: 0, Index: 0}}, // boundary sentinel
 		role:        Follower,
 		leaderID:    -1,
 		rng:         rand.New(rand.NewSource(cfg.Seed + int64(cfg.ID)*2654435761)),
@@ -117,8 +132,6 @@ func New(cfg Config) *Raft {
 	}
 	r.applyCond = sync.NewCond(&r.mu)
 
-	// Recover any durable state. Log entries load in ascending index order and
-	// sit after the sentinel, preserving log[i].Index == i.
 	ps, err := r.persister.Load()
 	if err != nil {
 		panic("raft: load persisted state: " + err.Error())
@@ -127,17 +140,37 @@ func New(cfg Config) *Raft {
 		r.currentTerm = ps.HardState.CurrentTerm
 		r.votedFor = ps.HardState.VotedFor
 	}
-	if len(ps.Entries) > 0 {
-		r.log = append(r.log, ps.Entries...)
+	if ps.HasSnap {
+		r.log[0] = LogEntry{Index: ps.Snapshot.LastIncludedIndex, Term: ps.Snapshot.LastIncludedTerm}
+		r.snapshot = ps.Snapshot.Data
+		r.commitIndex = ps.Snapshot.LastIncludedIndex
+		// lastApplied stays 0 so the applier delivers this snapshot to the state
+		// machine first (it will then advance lastApplied to LastIncludedIndex);
+		// the compacted range is never applied as commands because the pending
+		// snapshot is processed before any command.
+		r.pendingSnap = &pendingSnap{ps.Snapshot.LastIncludedIndex, ps.Snapshot.LastIncludedTerm, ps.Snapshot.Data}
 	}
-	// Phase 4 restores the snapshot boundary here.
+	// Append persisted entries, but keep only a contiguous suffix starting just
+	// past the snapshot boundary. SaveSnapshot and the log truncation are
+	// separate transactions, so a crash between them can leave entries the
+	// snapshot already covers (Index <= base()) on disk; appending those verbatim
+	// would break the log[i].Index == base()+i invariant. Drop them, and stop at
+	// any gap rather than reconstruct a non-contiguous log.
+	next := r.base() + 1
+	for _, e := range ps.Entries {
+		if e.Index < next {
+			continue // covered by the snapshot
+		}
+		if e.Index != next {
+			break // a gap would corrupt the index invariant
+		}
+		r.log = append(r.log, e)
+		next++
+	}
 	r.resetElectionTimer()
 	return r
 }
 
-// persistAppend / persistTruncateSuffix durably record log mutations before the
-// node acts on them. A durability failure is unrecoverable, so we stop hard.
-// Caller holds mu.
 func (r *Raft) persistAppend(entries []LogEntry) {
 	if err := r.persister.AppendEntries(entries); err != nil {
 		panic("raft: persist append failed: " + err.Error())
@@ -150,8 +183,7 @@ func (r *Raft) persistTruncateSuffix(index uint64) {
 	}
 }
 
-// Start launches the background loops: the election/heartbeat loop always, and
-// the apply loop when an apply channel is configured.
+// Start launches the background loops.
 func (r *Raft) Start() {
 	r.wg.Add(1)
 	go r.run()
@@ -165,7 +197,7 @@ func (r *Raft) Start() {
 func (r *Raft) Kill() {
 	close(r.dead)
 	r.mu.Lock()
-	r.applyCond.Broadcast() // wake the applier so it observes the shutdown
+	r.applyCond.Broadcast()
 	r.mu.Unlock()
 	r.wg.Wait()
 }
@@ -186,9 +218,26 @@ func (r *Raft) GetState() (term uint64, isLeader bool) {
 	return r.currentTerm, r.role == Leader
 }
 
-// Submit appends a command to the log if this node is the leader and kicks off
-// replication. It returns the index the command will occupy once committed, the
-// current term, and whether this node is the leader. It does NOT wait for commit.
+// LogSize reports the approximate on-disk size of the (uncompacted) log, so the
+// application can decide when to snapshot.
+func (r *Raft) LogSize() uint64 { return r.persister.LogBytes() }
+
+// base is the last snapshotted index; slice position of absolute index a is
+// a - base. Caller holds mu.
+func (r *Raft) base() uint64 { return r.log[0].Index }
+
+func (r *Raft) lastLogIndex() uint64 { return r.log[len(r.log)-1].Index }
+
+func (r *Raft) lastLogInfo() (index, term uint64) {
+	last := r.log[len(r.log)-1]
+	return last.Index, last.Term
+}
+
+// entry returns the log entry at absolute index a (a must be > base and <= last).
+// Caller holds mu.
+func (r *Raft) entry(a uint64) LogEntry { return r.log[a-r.base()] }
+
+// Submit appends a command if this node is the leader and kicks off replication.
 func (r *Raft) Submit(command []byte) (index uint64, term uint64, isLeader bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -198,19 +247,36 @@ func (r *Raft) Submit(command []byte) (index uint64, term uint64, isLeader bool)
 	index = r.lastLogIndex() + 1
 	entry := LogEntry{Term: r.currentTerm, Index: index, Command: append([]byte(nil), command...)}
 	r.log = append(r.log, entry)
-	r.persistAppend([]LogEntry{entry}) // durable before it may count toward commit
+	r.persistAppend([]LogEntry{entry})
 	r.matchIndex[r.id] = index
 	r.nextIndex[r.id] = index + 1
-	// Advance commit now so a single-node cluster (no followers to reply) still
-	// makes progress; a no-op for larger clusters until replicas ack.
 	r.maybeAdvanceCommit()
 	r.broadcastAppendEntries()
 	return index, r.currentTerm, true
 }
 
-// run is the single background loop. As leader it replicates (which doubles as
-// heartbeating) every heartbeatInterval; otherwise it starts an election once
-// its randomized election deadline passes.
+// Snapshot compacts the log: the application has captured all state up to and
+// including index in `data`, so Raft discards the log prefix through index.
+func (r *Raft) Snapshot(index uint64, data []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if index <= r.base() || index > r.commitIndex {
+		return // already compacted, or not yet committed
+	}
+	oldBase := r.base()
+	term := r.log[index-oldBase].Term
+	tail := append([]LogEntry(nil), r.log[index-oldBase+1:]...)
+	r.log = append([]LogEntry{{Index: index, Term: term}}, tail...)
+	r.snapshot = append([]byte(nil), data...)
+	if err := r.persister.SaveSnapshot(Snapshot{LastIncludedIndex: index, LastIncludedTerm: term, Data: data}); err != nil {
+		panic("raft: save snapshot: " + err.Error())
+	}
+	if err := r.persister.TruncatePrefix(index + 1); err != nil {
+		panic("raft: truncate prefix: " + err.Error())
+	}
+}
+
+// run is the single background loop.
 func (r *Raft) run() {
 	defer r.wg.Done()
 	var lastHeartbeat time.Time
@@ -233,50 +299,57 @@ func (r *Raft) run() {
 	}
 }
 
-// applier delivers newly-committed entries to applyCh in strict index order.
+// applier delivers committed entries (and installed snapshots) to applyCh in
+// strict order. A pending snapshot is delivered before any later command.
 func (r *Raft) applier() {
 	defer r.wg.Done()
 	r.mu.Lock()
 	for {
-		for r.lastApplied >= r.commitIndex && !r.killed() {
+		for r.pendingSnap == nil && r.lastApplied >= r.commitIndex && !r.killed() {
 			r.applyCond.Wait()
 		}
 		if r.killed() {
 			r.mu.Unlock()
 			return
 		}
+		if r.pendingSnap != nil {
+			snap := r.pendingSnap
+			r.pendingSnap = nil
+			if snap.index <= r.lastApplied {
+				continue // superseded by commands we already applied
+			}
+			r.lastApplied = snap.index
+			if r.commitIndex < snap.index {
+				r.commitIndex = snap.index
+			}
+			msg := ApplyMsg{SnapshotValid: true, Snapshot: append([]byte(nil), snap.data...), SnapshotIndex: snap.index, SnapshotTerm: snap.term}
+			r.mu.Unlock()
+			select {
+			case r.applyCh <- msg:
+			case <-r.dead:
+				return
+			}
+			r.mu.Lock()
+			continue
+		}
 		r.lastApplied++
-		e := r.log[r.lastApplied]
-		msg := ApplyMsg{Index: e.Index, Term: e.Term, Command: append([]byte(nil), e.Command...)}
+		e := r.entry(r.lastApplied)
+		msg := ApplyMsg{CommandValid: true, Command: append([]byte(nil), e.Command...), Index: e.Index, Term: e.Term}
 		r.mu.Unlock()
 		select {
 		case r.applyCh <- msg:
 		case <-r.dead:
-			return // mu already released
+			return
 		}
 		r.mu.Lock()
 	}
 }
 
-// resetElectionTimer schedules the next timeout at a fresh random point in
-// [min,max). Caller holds mu.
 func (r *Raft) resetElectionTimer() {
 	d := electionTimeoutMin + time.Duration(r.rng.Int63n(int64(electionTimeoutMax-electionTimeoutMin)))
 	r.electionDeadline = time.Now().Add(d)
 }
 
-// lastLogIndex / lastLogInfo read the tail of the log (the sentinel guarantees
-// there is always at least one entry). Caller holds mu.
-func (r *Raft) lastLogIndex() uint64 { return r.log[len(r.log)-1].Index }
-
-func (r *Raft) lastLogInfo() (index, term uint64) {
-	last := r.log[len(r.log)-1]
-	return last.Index, last.Term
-}
-
-// persist durably saves the Figure-2 persistent state. A durability failure is
-// unrecoverable — a node that cannot persist cannot safely participate — so we
-// stop hard rather than risk a safety violation. Caller holds mu.
 func (r *Raft) persist() {
 	if err := r.persister.SaveHardState(HardState{CurrentTerm: r.currentTerm, VotedFor: r.votedFor}); err != nil {
 		panic("raft: persist failed: " + err.Error())
@@ -284,19 +357,13 @@ func (r *Raft) persist() {
 }
 
 // stepDownIfBehind implements Figure 2's "if RPC term T > currentTerm: set
-// currentTerm = T, convert to follower". Returns true if it stepped down.
-// Caller holds mu.
+// currentTerm = T, convert to follower". Caller holds mu.
 func (r *Raft) stepDownIfBehind(term uint64) bool {
 	if term > r.currentTerm {
 		r.currentTerm = term
 		r.votedFor = NoVote
 		r.role = Follower
 		r.leaderID = -1
-		// A node that just learned of a higher term should wait a fresh
-		// randomized timeout before campaigning. Inbound RPC handlers reset the
-		// timer themselves, but the RPC-reply step-down paths (vote/heartbeat
-		// replies) do not — without this a just-deposed leader, whose deadline
-		// is always stale, would re-campaign on the very next tick.
 		r.resetElectionTimer()
 		r.persist()
 		return true
@@ -304,8 +371,7 @@ func (r *Raft) stepDownIfBehind(term uint64) bool {
 	return false
 }
 
-// candidateUpToDate applies the §5.4.1 election restriction: a candidate's log
-// must be at least as up-to-date as ours to earn a vote. Caller holds mu.
+// candidateUpToDate applies the §5.4.1 election restriction. Caller holds mu.
 func (r *Raft) candidateUpToDate(lastLogIndex, lastLogTerm uint64) bool {
 	myIndex, myTerm := r.lastLogInfo()
 	if lastLogTerm != myTerm {
@@ -314,8 +380,7 @@ func (r *Raft) candidateUpToDate(lastLogIndex, lastLogTerm uint64) bool {
 	return lastLogIndex >= myIndex
 }
 
-// startElection converts to candidate for a new term and solicits votes. Caller
-// holds mu; vote replies are processed on separate goroutines.
+// startElection converts to candidate and solicits votes. Caller holds mu.
 func (r *Raft) startElection() {
 	r.role = Candidate
 	r.currentTerm++
@@ -325,11 +390,9 @@ func (r *Raft) startElection() {
 
 	term := r.currentTerm
 	lastIndex, lastTerm := r.lastLogInfo()
-	votes := 1 // vote for self
+	votes := 1
 
-	// In a single-node cluster the self-vote is already a majority; there are no
-	// peers to reply and drive becomeLeader, so win immediately.
-	if votes*2 > len(r.peers) {
+	if votes*2 > len(r.peers) { // single-node cluster wins immediately
 		r.becomeLeader()
 		return
 	}
@@ -339,12 +402,7 @@ func (r *Raft) startElection() {
 			continue
 		}
 		go func(peer int) {
-			args := &RequestVoteArgs{
-				Term:         term,
-				CandidateID:  r.id,
-				LastLogIndex: lastIndex,
-				LastLogTerm:  lastTerm,
-			}
+			args := &RequestVoteArgs{Term: term, CandidateID: r.id, LastLogIndex: lastIndex, LastLogTerm: lastTerm}
 			reply, err := r.transport.SendRequestVote(context.Background(), peer, args)
 			if err != nil {
 				return
@@ -355,7 +413,7 @@ func (r *Raft) startElection() {
 				return
 			}
 			if r.role != Candidate || r.currentTerm != term {
-				return // stale reply
+				return
 			}
 			if reply.VoteGranted {
 				votes++
@@ -367,9 +425,7 @@ func (r *Raft) startElection() {
 	}
 }
 
-// becomeLeader transitions to leader, initializes per-follower replication
-// bookkeeping, and immediately establishes authority with a replication round.
-// Caller holds mu.
+// becomeLeader initializes replication bookkeeping and asserts authority.
 func (r *Raft) becomeLeader() {
 	if r.role != Candidate {
 		return
@@ -388,8 +444,6 @@ func (r *Raft) becomeLeader() {
 	r.broadcastAppendEntries()
 }
 
-// broadcastAppendEntries starts a replication round to every follower. Caller
-// holds mu; each peer is handled on its own goroutine.
 func (r *Raft) broadcastAppendEntries() {
 	term := r.currentTerm
 	for _, peer := range r.peers {
@@ -400,24 +454,49 @@ func (r *Raft) broadcastAppendEntries() {
 	}
 }
 
-// replicateTo sends one AppendEntries to peer with everything from nextIndex
-// onward (empty ⇒ a heartbeat), then processes the reply: advance match/next on
-// success, or back up nextIndex via the fast-conflict hints on failure.
+// replicateTo sends one AppendEntries (or InstallSnapshot, if the follower needs
+// a compacted prefix) and processes the reply.
 func (r *Raft) replicateTo(peer int, term uint64) {
 	r.mu.Lock()
 	if r.role != Leader || r.currentTerm != term {
 		r.mu.Unlock()
 		return
 	}
-	ni := r.nextIndex[peer]
-	if ni < 1 {
-		ni = 1
+
+	if r.nextIndex[peer] <= r.base() {
+		// Follower needs entries we've compacted away — ship the snapshot.
+		args := &InstallSnapshotArgs{
+			Term:              term,
+			LeaderID:          r.id,
+			LastIncludedIndex: r.base(),
+			LastIncludedTerm:  r.log[0].Term,
+			Data:              append([]byte(nil), r.snapshot...),
+		}
+		r.mu.Unlock()
+		reply, err := r.transport.SendInstallSnapshot(context.Background(), peer, args)
+		if err != nil {
+			return
+		}
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.stepDownIfBehind(reply.Term) {
+			return
+		}
+		if r.role != Leader || r.currentTerm != term {
+			return
+		}
+		if args.LastIncludedIndex > r.matchIndex[peer] {
+			r.matchIndex[peer] = args.LastIncludedIndex
+		}
+		r.nextIndex[peer] = r.matchIndex[peer] + 1
+		r.maybeAdvanceCommit()
+		return
 	}
+
+	ni := r.nextIndex[peer]
 	prevIndex := ni - 1
-	prevTerm := r.log[prevIndex].Term
-	// Everything from nextIndex onward (a copy, so the follower's gob-encode
-	// can't race the leader mutating its log). Empty ⇒ a heartbeat.
-	entries := append([]LogEntry(nil), r.log[ni:]...)
+	prevTerm := r.entry(prevIndex).Term
+	entries := append([]LogEntry(nil), r.log[ni-r.base():]...)
 	leaderCommit := r.commitIndex
 	r.mu.Unlock()
 
@@ -433,14 +512,13 @@ func (r *Raft) replicateTo(peer int, term uint64) {
 	if err != nil {
 		return
 	}
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.stepDownIfBehind(reply.Term) {
 		return
 	}
 	if r.role != Leader || r.currentTerm != term {
-		return // stale reply
+		return
 	}
 	if reply.Success {
 		match := prevIndex + uint64(len(entries))
@@ -450,47 +528,41 @@ func (r *Raft) replicateTo(peer int, term uint64) {
 		r.nextIndex[peer] = r.matchIndex[peer] + 1
 		r.maybeAdvanceCommit()
 	} else if r.nextIndex[peer] == ni {
-		// Only back up if nextIndex hasn't moved since we sent (avoids thrashing
-		// on reordered replies).
 		r.nextIndex[peer] = r.backupIndex(reply, ni)
 	}
 }
 
 // backupIndex computes the next nextIndex after a rejected AppendEntries using
-// the follower's fast-conflict hints (§5.3 optimization). Caller holds mu.
+// the follower's fast-conflict hints. Caller holds mu.
 func (r *Raft) backupIndex(reply *AppendEntriesReply, ni uint64) uint64 {
 	if reply.ConflictTerm == 0 {
-		// Follower's log is shorter than prevLogIndex; jump to its end.
 		if reply.ConflictIndex >= 1 {
 			return reply.ConflictIndex
 		}
 		return 1
 	}
-	// Find the last entry in our log with term == ConflictTerm.
-	for i := r.lastLogIndex(); i >= 1; i-- {
-		if r.log[i].Term == reply.ConflictTerm {
+	for i := r.lastLogIndex(); i > r.base(); i-- {
+		if r.entry(i).Term == reply.ConflictTerm {
 			return i + 1
 		}
-		if r.log[i].Term < reply.ConflictTerm {
+		if r.entry(i).Term < reply.ConflictTerm {
 			break
 		}
 	}
-	// We don't have that term: fall back to the follower's first index for it.
 	if reply.ConflictIndex >= 1 {
 		return reply.ConflictIndex
 	}
 	return 1
 }
 
-// maybeAdvanceCommit advances commitIndex to the highest index replicated on a
-// majority whose entry is from the current term (§5.4.2). Caller holds mu; leader
-// only.
+// maybeAdvanceCommit advances commitIndex to the highest current-term index
+// replicated on a majority (§5.4.2). Caller holds mu; leader only.
 func (r *Raft) maybeAdvanceCommit() {
 	for n := r.lastLogIndex(); n > r.commitIndex; n-- {
-		if r.log[n].Term != r.currentTerm {
-			break // terms are non-decreasing; older-term entries can't commit directly
+		if r.entry(n).Term != r.currentTerm {
+			break
 		}
-		count := 1 // self
+		count := 1
 		for _, peer := range r.peers {
 			if peer != r.id && r.matchIndex[peer] >= n {
 				count++

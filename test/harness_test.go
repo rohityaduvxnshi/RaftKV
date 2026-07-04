@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rohityaduvxnshi/RaftKV/internal/kv"
 	"github.com/rohityaduvxnshi/RaftKV/internal/raft"
 	"github.com/rohityaduvxnshi/RaftKV/internal/storage/bolt"
 	"github.com/rohityaduvxnshi/RaftKV/internal/transport/inmem"
@@ -28,6 +29,9 @@ type cluster struct {
 	applyChs   []chan raft.ApplyMsg
 	connected  []bool
 
+	snapThreshold uint64      // if >0, a node snapshots once its log exceeds this many bytes
+	stores        []*kv.Store // per-node state machine (rebuilt from applyCh)
+
 	amu       sync.Mutex
 	committed map[uint64][]byte   // index -> the agreed command (State Machine Safety oracle)
 	applied   []map[uint64][]byte // per node: index -> command it applied
@@ -46,49 +50,61 @@ func makeCluster(t *testing.T, n int, seed int64, reliable bool) *cluster {
 		}
 		return mems[i] // same object across restarts: state survives
 	}
-	return newCluster(t, n, seed, reliable, factory)
+	return newCluster(t, n, seed, reliable, 0, factory)
 }
 
 // makeClusterBolt builds an N-node cluster backed by real bbolt files under a
 // temp dir, so crashAndRestart genuinely reloads durable state from disk.
 func makeClusterBolt(t *testing.T, n int, seed int64, reliable bool) *cluster {
+	return newCluster(t, n, seed, reliable, 0, boltFactory(t))
+}
+
+// makeClusterBoltSnap is a bbolt-backed cluster that snapshots whenever a node's
+// log grows past threshold bytes (Phase 4 compaction tests).
+func makeClusterBoltSnap(t *testing.T, n int, seed int64, reliable bool, threshold uint64) *cluster {
+	return newCluster(t, n, seed, reliable, threshold, boltFactory(t))
+}
+
+func boltFactory(t *testing.T) func(i int) raft.Persister {
 	dir := t.TempDir()
-	factory := func(i int) raft.Persister {
+	return func(i int) raft.Persister {
 		p, err := bolt.Open(filepath.Join(dir, fmt.Sprintf("raft-%d.db", i)))
 		if err != nil {
 			t.Fatalf("open bolt for node %d: %v", i, err)
 		}
 		return p // reopening the same file reloads on-disk state
 	}
-	return newCluster(t, n, seed, reliable, factory)
 }
 
-func newCluster(t *testing.T, n int, seed int64, reliable bool, pfactory func(i int) raft.Persister) *cluster {
+func newCluster(t *testing.T, n int, seed int64, reliable bool, snapThreshold uint64, pfactory func(i int) raft.Persister) *cluster {
 	peers := make([]int, n)
 	for i := range peers {
 		peers[i] = i
 	}
 	c := &cluster{
-		t:          t,
-		n:          n,
-		seed:       seed,
-		peers:      peers,
-		net:        inmem.NewNetwork(seed),
-		rafts:      make([]*raft.Raft, n),
-		persisters: make([]raft.Persister, n),
-		pfactory:   pfactory,
-		applyChs:   make([]chan raft.ApplyMsg, n),
-		connected:  make([]bool, n),
-		committed:  make(map[uint64][]byte),
-		applied:    make([]map[uint64][]byte, n),
-		nextApply:  make([]uint64, n),
-		done:       make(chan struct{}),
+		t:             t,
+		n:             n,
+		seed:          seed,
+		peers:         peers,
+		net:           inmem.NewNetwork(seed),
+		rafts:         make([]*raft.Raft, n),
+		persisters:    make([]raft.Persister, n),
+		pfactory:      pfactory,
+		applyChs:      make([]chan raft.ApplyMsg, n),
+		connected:     make([]bool, n),
+		snapThreshold: snapThreshold,
+		stores:        make([]*kv.Store, n),
+		committed:     make(map[uint64][]byte),
+		applied:       make([]map[uint64][]byte, n),
+		nextApply:     make([]uint64, n),
+		done:          make(chan struct{}),
 	}
 	c.net.SetReliable(reliable)
 	for i := 0; i < n; i++ {
 		c.persisters[i] = pfactory(i)
 		c.applyChs[i] = make(chan raft.ApplyMsg, 256)
 		c.applied[i] = make(map[uint64][]byte)
+		c.stores[i] = kv.New()
 		c.nextApply[i] = 1 // index 0 is the sentinel, never applied
 		c.rafts[i] = raft.New(raft.Config{
 			ID:        i,
@@ -102,7 +118,7 @@ func newCluster(t *testing.T, n int, seed int64, reliable bool, pfactory func(i 
 		c.connected[i] = true
 	}
 	for i := 0; i < n; i++ {
-		go c.drain(i, c.applyChs[i])
+		go c.drain(i, c.rafts[i], c.stores[i], c.applyChs[i])
 		c.rafts[i].Start()
 	}
 	return c
@@ -114,6 +130,7 @@ func newCluster(t *testing.T, n int, seed int64, reliable bool, pfactory func(i 
 func (c *cluster) bringUp(i int) {
 	c.persisters[i] = c.pfactory(i)
 	c.applyChs[i] = make(chan raft.ApplyMsg, 256)
+	c.stores[i] = kv.New() // rebuilt from the apply channel (snapshot + replayed log)
 	c.amu.Lock()
 	c.nextApply[i] = 1
 	c.applied[i] = make(map[uint64][]byte)
@@ -128,7 +145,7 @@ func (c *cluster) bringUp(i int) {
 	})
 	c.net.Register(i, c.rafts[i])
 	c.net.SetConnected(i, c.connected[i]) // Register re-connects; restore partition state
-	go c.drain(i, c.applyChs[i])
+	go c.drain(i, c.rafts[i], c.stores[i], c.applyChs[i])
 }
 
 // crashAndRestart simulates a kill -9 + restart of node i: stop it, close and
@@ -167,12 +184,23 @@ func (c *cluster) cleanup() {
 	}
 }
 
-// drain consumes a node's committed entries, asserting State Machine Safety (all
-// nodes apply the same command at each index) and in-order, gap-free apply.
-func (c *cluster) drain(i int, ch chan raft.ApplyMsg) {
+// drain consumes a node's applied entries: it applies commands to the node's
+// state machine and asserts State Machine Safety (all nodes apply the same
+// command at each index) and in-order, gap-free apply. On a snapshot install it
+// restores the state machine. When snapshotting is enabled, it compacts the log
+// once it grows past the threshold. rf and store are captured so a restart's new
+// drain doesn't race the reassignment of c.rafts[i]/c.stores[i].
+func (c *cluster) drain(i int, rf *raft.Raft, store *kv.Store, ch chan raft.ApplyMsg) {
 	for {
 		select {
 		case msg := <-ch:
+			if msg.SnapshotValid {
+				store.Restore(msg.Snapshot)
+				c.amu.Lock()
+				c.nextApply[i] = msg.SnapshotIndex + 1
+				c.amu.Unlock()
+				continue
+			}
 			c.amu.Lock()
 			if prev, ok := c.committed[msg.Index]; ok {
 				if !bytes.Equal(prev, msg.Command) {
@@ -190,6 +218,11 @@ func (c *cluster) drain(i int, ch chan raft.ApplyMsg) {
 			c.nextApply[i] = msg.Index + 1
 			c.applied[i][msg.Index] = append([]byte(nil), msg.Command...)
 			c.amu.Unlock()
+
+			store.Apply(msg.Command)
+			if c.snapThreshold > 0 && rf.LogSize() > c.snapThreshold {
+				rf.Snapshot(msg.Index, store.Snapshot())
+			}
 		case <-c.done:
 			return
 		}

@@ -84,6 +84,42 @@ func (s *Store) Get(key string) (string, bool) {
 	return v, ok
 }
 
+// Dump returns a copy of the store's contents (for tests: compare state across
+// nodes order-independently, since gob map bytes aren't stable across encoders).
+func (s *Store) Dump() map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	m := make(map[string]string, len(s.data))
+	for k, v := range s.data {
+		m[k] = v
+	}
+	return m
+}
+
+// Snapshot serializes the whole store, for Raft log compaction.
+func (s *Store) Snapshot() []byte {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(s.data); err != nil {
+		panic("kv: snapshot: " + err.Error())
+	}
+	return buf.Bytes()
+}
+
+// Restore replaces the store's contents from a snapshot produced by Snapshot.
+func (s *Store) Restore(data []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m := make(map[string]string)
+	if len(data) > 0 {
+		if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&m); err != nil {
+			panic("kv: restore: " + err.Error())
+		}
+	}
+	s.data = m
+}
+
 // --- command encoding ---
 
 func encode(op Op) []byte {

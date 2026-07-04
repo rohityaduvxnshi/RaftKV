@@ -16,8 +16,8 @@ linearizable reads, and idempotent client sessions. It follows Ongaro &
 Ousterhout's Raft paper **Figure 2** exactly; deliberate deviations are recorded
 in §3.
 
-**Current phase.** Phase 3 complete (persistence & crash recovery). Next: Phase 4
-(snapshotting / log compaction).
+**Current phase.** Phase 4 complete (snapshotting / log compaction). Next: Phase 5
+(client API & linearizable reads).
 
 **High-level architecture (grown per phase):**
 
@@ -69,6 +69,33 @@ just by swapping implementations.
 ## 2. Version history
 
 Entries map 1:1 to git tags.
+
+### v0.5 — Phase 4: snapshotting / log compaction (2026-07-04)
+
+**Added:**
+- Snapshot boundary offset in `internal/raft`: `log[0]` is a boundary sentinel
+  whose `Index` is the last snapshotted index (`base()`); `log[i].Index ==
+  base()+i`, and absolute index `a` maps to slice position `a-base()`. With no
+  snapshot, `base()==0` and the code is behaviorally identical to Phase 3
+  (verified — all prior tests stayed green through the refactor).
+- `Raft.Snapshot(index, data)` (app-triggered compaction: save snapshot +
+  `TruncatePrefix`), `Raft.LogSize()`, the `InstallSnapshot` RPC (leader sends it
+  when `nextIndex[peer] <= base()`; follower installs, keeping a matching suffix
+  or discarding the log), and snapshot delivery to the state machine via
+  `ApplyMsg{SnapshotValid,...}`. `New` restores from a persisted snapshot.
+- `kv.Store` gains `Snapshot`/`Restore`/`Dump`.
+- Harness: per-node state machines rebuilt from the apply channel,
+  threshold-triggered snapshotting, and `checkStoresAgree` (State Machine Safety
+  across command + snapshot applies).
+
+**Acceptance result (Windows dev box, Go 1.26.4 + mingw-w64 for -race):**
+- Log stays **bounded** under sustained writes (`TestSnapshotBoundsLog`).
+- A follower whose needed prefix is compacted is caught up via **InstallSnapshot**
+  (`TestInstallSnapshotCatchup`).
+- **Restart-from-snapshot** rebuilds the state machine (`TestRestartFromSnapshot`).
+- `go test -race ./...` green; **2× repeat, no flakiness**; `vet` + `gofmt`
+  clean. 3-lens adversarial review found a real crash-safety bug (torn-snapshot
+  recovery), now fixed + regression-tested (see §3).
 
 ### v0.4 — Phase 3: persistence & crash recovery (2026-07-04)
 
@@ -182,6 +209,23 @@ Entries map 1:1 to git tags.
 
 ## 3. Changes (running changelog, incl. reversals & what didn't work)
 
+- **2026-07-04 — Phase 4 review caught a torn-snapshot crash-safety bug.** All 3
+  review lenses independently flagged the same real defect: `Snapshot()` and
+  `HandleInstallSnapshot()` persist via `SaveSnapshot` then a *separate*
+  `TruncatePrefix`/`TruncateSuffix` transaction (correctly snapshot-before-
+  truncate, so no data loss), but a crash *between* the two leaves the snapshot
+  plus the un-truncated log prefix on disk. `New()` then appended every persisted
+  entry verbatim, producing `log = [{S},{1},...,{N}]` — breaking the
+  `log[i].Index == base()+i` invariant and silently corrupting apply/replication
+  (no panic). Tests missed it because `crashAndRestart` only kills at clean points
+  and MemPersister reuses its object across "restart". **Fixed** in `New()` by
+  keeping only a contiguous suffix from `base()+1` (dropping snapshot-covered
+  entries, stopping at any gap) — robust to a crash in any of the three
+  save→truncate windows without needing an atomic multi-key transaction. Added a
+  white-box regression test (`recover_test.go`) that builds the exact torn
+  on-disk state. This is the durability lesson of the whole project: correct
+  *ordering* isn't enough when the *reload* path must tolerate the torn state
+  that ordering deliberately permits.
 - **2026-07-04 — Phase 3 review clean; persist-ordering is the crux.** The 3-lens
   adversarial review (crash-consistency, bbolt store, recovery/concurrency)
   found **no defects**. The property that makes separate-transaction persistence
@@ -274,13 +318,11 @@ exactly what is live vs. local when it lands.
 
 ## 5. Known issues / next
 
-- **Next:** Phase 4 — snapshotting / log compaction. Snapshot the KV state
-  machine at a size/index threshold (`Persister.SaveSnapshot` +
-  `TruncatePrefix` already exist), track a snapshot boundary offset so
-  `log[i].Index == i` becomes `log[i-base].Index == i`, add the
-  `InstallSnapshot` RPC for followers whose needed prefix is compacted, and
-  restore-from-snapshot on restart. Assert the log stays bounded and a lagging
-  follower is caught up via `InstallSnapshot`.
+- **Next:** Phase 5 — client API & linearizable reads. HTTP KV API with leader
+  redirect/hint; client sessions (`clientID`+`seqNo`) for exactly-once retries
+  (dedup in the KV state machine); linearizable reads via ReadIndex or a leader
+  lease (not stale local reads). A no-op-on-election barrier likely lands here
+  (also resolves the §5.4.2 immediate re-commit note below).
 - **§5.4.2 note (for Phase 5):** after a restart/new election, recovered
   committed entries re-apply only once a current-term entry commits. Tests cover
   this with a post-restart write. A no-op-on-election (or the ReadIndex barrier)
