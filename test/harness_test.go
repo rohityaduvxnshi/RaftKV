@@ -34,6 +34,7 @@ type cluster struct {
 
 	amu       sync.Mutex
 	committed map[uint64][]byte   // index -> the agreed command (State Machine Safety oracle)
+	noops     map[uint64]struct{} // indices occupied by election no-op entries
 	applied   []map[uint64][]byte // per node: index -> command it applied
 	nextApply []uint64            // per node: next index expected (in-order check)
 	done      chan struct{}
@@ -95,6 +96,7 @@ func newCluster(t *testing.T, n int, seed int64, reliable bool, snapThreshold ui
 		snapThreshold: snapThreshold,
 		stores:        make([]*kv.Store, n),
 		committed:     make(map[uint64][]byte),
+		noops:         make(map[uint64]struct{}),
 		applied:       make([]map[uint64][]byte, n),
 		nextApply:     make([]uint64, n),
 		done:          make(chan struct{}),
@@ -198,6 +200,19 @@ func (c *cluster) drain(i int, rf *raft.Raft, store *kv.Store, ch chan raft.Appl
 				store.Restore(msg.Snapshot)
 				c.amu.Lock()
 				c.nextApply[i] = msg.SnapshotIndex + 1
+				c.amu.Unlock()
+				continue
+			}
+			if msg.NoOp {
+				// Election barrier: occupies a log index but carries no command.
+				// Keep the in-order counter contiguous, but don't apply it — just
+				// remember the index so applyAll knows it's not a real gap.
+				c.amu.Lock()
+				if msg.Index != c.nextApply[i] {
+					c.t.Errorf("node %d applied index %d out of order (expected %d)", i, msg.Index, c.nextApply[i])
+				}
+				c.nextApply[i] = msg.Index + 1
+				c.noops[msg.Index] = struct{}{}
 				c.amu.Unlock()
 				continue
 			}

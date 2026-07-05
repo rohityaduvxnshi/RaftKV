@@ -50,6 +50,7 @@ type ApplyMsg struct {
 	Command      []byte
 	Index        uint64
 	Term         uint64
+	NoOp         bool // an election barrier entry: advance appliedIndex but don't apply
 
 	SnapshotValid bool
 	Snapshot      []byte
@@ -222,6 +223,98 @@ func (r *Raft) GetState() (term uint64, isLeader bool) {
 // application can decide when to snapshot.
 func (r *Raft) LogSize() uint64 { return r.persister.LogBytes() }
 
+// LeaderID returns the ID of the leader this node last recognized, or -1 if
+// unknown. The client API uses it to redirect a request to the current leader.
+func (r *Raft) LeaderID() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.leaderID
+}
+
+// ReadIndex returns a commit index safe to serve a linearizable read at, after
+// confirming via a heartbeat quorum that this node is still the leader. ok is
+// false if this node is not the leader, has not yet committed an entry in its
+// term (the election no-op), or cannot confirm leadership — the caller should
+// then redirect to the leader or retry. The caller must also wait until its
+// state machine has applied through the returned index before reading.
+func (r *Raft) ReadIndex(ctx context.Context) (index uint64, ok bool) {
+	r.mu.Lock()
+	if r.role != Leader {
+		r.mu.Unlock()
+		return 0, false
+	}
+	term := r.currentTerm
+	// §8: only once a current-term entry is committed does commitIndex reflect
+	// every committed entry, so a read at it cannot miss an acknowledged write.
+	if r.commitIndex <= r.base() || r.entry(r.commitIndex).Term != term {
+		r.mu.Unlock()
+		return 0, false
+	}
+	readIndex := r.commitIndex
+	r.mu.Unlock()
+
+	if !r.confirmQuorum(ctx, term) {
+		return 0, false
+	}
+	return readIndex, true
+}
+
+// confirmQuorum sends one heartbeat round and returns true once a majority
+// (including self) still acknowledges this leader for term — proving no newer
+// leader has been elected, so a read at the captured index is linearizable.
+func (r *Raft) confirmQuorum(ctx context.Context, term uint64) bool {
+	r.mu.Lock()
+	if r.role != Leader || r.currentTerm != term {
+		r.mu.Unlock()
+		return false
+	}
+	prevIndex, prevTerm := r.lastLogInfo()
+	leaderCommit := r.commitIndex
+	r.mu.Unlock()
+
+	results := make(chan bool, len(r.peers))
+	sent := 0
+	for _, peer := range r.peers {
+		if peer == r.id {
+			continue
+		}
+		sent++
+		go func(peer int) {
+			args := &AppendEntriesArgs{Term: term, LeaderID: r.id, PrevLogIndex: prevIndex, PrevLogTerm: prevTerm, LeaderCommit: leaderCommit}
+			reply, err := r.transport.SendAppendEntries(ctx, peer, args)
+			if err != nil {
+				results <- false
+				return
+			}
+			r.mu.Lock()
+			r.stepDownIfBehind(reply.Term)
+			stillLeader := r.role == Leader && r.currentTerm == term && reply.Term == term
+			r.mu.Unlock()
+			results <- stillLeader
+		}(peer)
+	}
+
+	acks := 1 // self
+	need := len(r.peers)/2 + 1
+	if acks >= need {
+		return true // single-node cluster
+	}
+	for i := 0; i < sent; i++ {
+		select {
+		case ok := <-results:
+			if ok {
+				acks++
+				if acks >= need {
+					return true
+				}
+			}
+		case <-ctx.Done():
+			return false
+		}
+	}
+	return acks >= need
+}
+
 // base is the last snapshotted index; slice position of absolute index a is
 // a - base. Caller holds mu.
 func (r *Raft) base() uint64 { return r.log[0].Index }
@@ -334,7 +427,7 @@ func (r *Raft) applier() {
 		}
 		r.lastApplied++
 		e := r.entry(r.lastApplied)
-		msg := ApplyMsg{CommandValid: true, Command: append([]byte(nil), e.Command...), Index: e.Index, Term: e.Term}
+		msg := ApplyMsg{CommandValid: true, Command: append([]byte(nil), e.Command...), Index: e.Index, Term: e.Term, NoOp: e.NoOp}
 		r.mu.Unlock()
 		select {
 		case r.applyCh <- msg:
@@ -440,7 +533,15 @@ func (r *Raft) becomeLeader() {
 		r.nextIndex[p] = last + 1
 		r.matchIndex[p] = 0
 	}
-	r.matchIndex[r.id] = last
+	// Commit a no-op in this term (§8). It advances commitIndex to cover
+	// recovered prior-term entries (making them re-apply immediately) and lets
+	// ReadIndex serve linearizable reads once it commits.
+	noop := LogEntry{Term: r.currentTerm, Index: last + 1, NoOp: true}
+	r.log = append(r.log, noop)
+	r.persistAppend([]LogEntry{noop})
+	r.matchIndex[r.id] = last + 1
+	r.nextIndex[r.id] = last + 2
+	r.maybeAdvanceCommit()
 	r.broadcastAppendEntries()
 }
 

@@ -15,11 +15,14 @@ const NoVote = -1
 
 // LogEntry is a single command replicated through the Raft log. Command is an
 // opaque blob interpreted only by the state machine (the KV store), never by
-// Raft itself.
+// Raft itself. NoOp marks the blank entry a leader commits at the start of its
+// term (§8): it carries no command and the state machine ignores it, but it
+// advances commitIndex so the leader can serve linearizable reads.
 type LogEntry struct {
 	Term    uint64
 	Index   uint64
 	Command []byte
+	NoOp    bool
 }
 
 // HardState is the subset of Raft state that MUST survive a crash before the

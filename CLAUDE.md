@@ -16,8 +16,8 @@ linearizable reads, and idempotent client sessions. It follows Ongaro &
 Ousterhout's Raft paper **Figure 2** exactly; deliberate deviations are recorded
 in §3.
 
-**Current phase.** Phase 4 complete (snapshotting / log compaction). Next: Phase 5
-(client API & linearizable reads).
+**Current phase.** Phase 5 complete (client API, exactly-once sessions,
+linearizable reads). Next: Phase 6 (cluster deployment & observability).
 
 **High-level architecture (grown per phase):**
 
@@ -69,6 +69,37 @@ just by swapping implementations.
 ## 2. Version history
 
 Entries map 1:1 to git tags.
+
+### v0.6 — Phase 5: client API, exactly-once sessions, linearizable reads (2026-07-05)
+
+**Added:**
+- Raft-core read machinery (`internal/raft`): a **no-op-on-election barrier**
+  (§8) committed in `becomeLeader` (a `LogEntry{NoOp:true}` the state machine
+  ignores) so `commitIndex` reflects all commits and recovered prior-term entries
+  re-apply immediately; `ReadIndex(ctx)` (readiness check + `confirmQuorum`
+  heartbeat round) for linearizable reads; `LeaderID()` for redirect.
+- `internal/kv` client sessions: `Op` carries `ClientID`+`SeqNo`; `Apply` dedups
+  retries (last-seq + cached result per client), and the session table is
+  included in snapshots so exactly-once survives compaction. Added `OpAppend`
+  (non-idempotent, makes double-apply observable). Dedup keys on a non-empty
+  `ClientID` (`SeqNo 0` is a valid first sequence number).
+- `internal/api`: `Server` (applies committed entries into a `kv.Store`, tracks
+  `appliedIndex`, waits per-index for write results with a term-check, serves
+  linearizable reads via `ReadIndex`+wait, redirects non-leaders) and a net/http
+  handler (`GET/PUT/DELETE/POST cas|append`, `X-Client-Id`/`X-Seq-No` headers,
+  307 redirect to the leader).
+
+**Acceptance result (Windows dev box, Go 1.26.4 + mingw-w64 for -race):**
+- A **retried write** (same `ClientID`+`SeqNo`) is applied **exactly once**
+  (`TestExactlyOnceRetry`, `TestZeroSeqDedup`).
+- A leader isolated into a minority **refuses a stale read** (ReadIndex quorum
+  confirmation fails) while the majority's new leader serves the fresh value
+  (`TestNoStaleRead`).
+- Writes to a non-leader are **redirected** (`TestWriteToFollowerRedirects`);
+  HTTP round-trip works (`TestHTTPRoundTrip`); single-node fast-commit path
+  (`TestSingleNodeAPI`).
+- `go test -race ./...` green; **2× repeat, no flakiness**; `vet` + `gofmt`
+  clean. 3-lens adversarial review found 2 real bugs (now fixed, see §3).
 
 ### v0.5 — Phase 4: snapshotting / log compaction (2026-07-04)
 
@@ -209,6 +240,28 @@ Entries map 1:1 to git tags.
 
 ## 3. Changes (running changelog, incl. reversals & what didn't work)
 
+- **2026-07-05 — Phase 5 review found a lost-wakeup race + a dedup gap.** The
+  3-lens review (linearizability / exactly-once / API-concurrency) confirmed 2
+  real bugs and correctly rejected 1 (a "wrong result for a retried older
+  request" that requires breaking the standard single-outstanding-request client
+  contract). **(1)** `api.Server.mutate` registered its result waiter *after*
+  `Submit` returned, so a fast commit (notably N=1, where `Submit` advances
+  commitIndex synchronously) could apply-and-notify before the waiter existed →
+  the notification was dropped and a committed write spuriously timed out. Fixed
+  by registering the waiter under `s.mu` spanning `Submit` (applyLoop takes
+  `s.mu` to deliver, so it blocks until registration; no deadlock — `Submit`
+  never waits on `s.mu`, `applyCh` is buffered). *Honest caveat:* the race is a
+  narrow window that the N=1 test does **not** reliably trigger (like the Phase-1
+  timer bug) — the fix is correct regardless. **(2)** Dedup was gated on
+  `SeqNo != 0`, silently disabling exactly-once for a client that 0-indexes its
+  sequence (or omits the `X-Seq-No` header). Fixed to gate on a non-empty
+  `ClientID` alone; regression test `TestZeroSeqDedup` (reliably reproduced the
+  double-apply before the fix). The no-op-on-election barrier also resolves the
+  §5.4.2 immediate-re-commit note from Phase 3.
+- **2026-07-05 — checkOneLeader de-flaked.** Widened the poll window (~720 ms →
+  ~3 s, still early-returning on success) so a loaded machine / CI runner doesn't
+  spuriously report "no leader" mid-election. `TestSnapshotBoundsLog` was the
+  visible victim under background load.
 - **2026-07-04 — Phase 4 review caught a torn-snapshot crash-safety bug.** All 3
   review lenses independently flagged the same real defect: `Snapshot()` and
   `HandleInstallSnapshot()` persist via `SaveSnapshot` then a *separate*
@@ -318,16 +371,18 @@ exactly what is live vs. local when it lands.
 
 ## 5. Known issues / next
 
-- **Next:** Phase 5 — client API & linearizable reads. HTTP KV API with leader
-  redirect/hint; client sessions (`clientID`+`seqNo`) for exactly-once retries
-  (dedup in the KV state machine); linearizable reads via ReadIndex or a leader
-  lease (not stale local reads). A no-op-on-election barrier likely lands here
-  (also resolves the §5.4.2 immediate re-commit note below).
-- **§5.4.2 note (for Phase 5):** after a restart/new election, recovered
-  committed entries re-apply only once a current-term entry commits. Tests cover
-  this with a post-restart write. A no-op-on-election (or the ReadIndex barrier)
-  would make re-application immediate — deferred to Phase 5 (also needed for
-  linearizable reads).
+- **Next:** Phase 6 — cluster deployment & observability. A real **gRPC
+  Transport** (protobuf; passes the same replication tests as the in-mem one),
+  `docker-compose.{3,5}node.yml`, Prometheus scraping each node, and a Grafana
+  dashboard (leader/term, `commitIndex`/`lastApplied`, throughput, p50/p99).
+  `cmd/raftkvd` gets fully wired here (it needs the gRPC transport to run a real
+  multi-process cluster). A stray `deploy/prometheus/prometheus.yml` is already
+  staged.
+- **§5.4.2 resolved (Phase 5).** The no-op-on-election barrier now advances
+  commitIndex to cover recovered prior-term entries the moment a leader is
+  elected, so re-application is immediate (no post-restart write needed). It also
+  underpins linearizable reads (ReadIndex requires a committed current-term
+  entry).
 - **Deferred (noted, not blocking):** outbound RPC goroutines are fire-and-forget
   with `context.Background()`; persist-under-lock serializes the node during
   fsync (perf, not correctness). A virtual clock is also deferred.

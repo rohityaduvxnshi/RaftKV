@@ -22,11 +22,14 @@ func (c *cluster) applyAll() *kv.Store {
 	}
 	st := kv.New()
 	for i := uint64(1); i <= max; i++ {
-		cmd, ok := c.committed[i]
-		if !ok {
-			c.t.Fatalf("gap in committed log at index %d (Log Matching violated)", i)
+		if cmd, ok := c.committed[i]; ok {
+			st.Apply(cmd)
+			continue
 		}
-		st.Apply(cmd)
+		if _, isNoop := c.noops[i]; isNoop {
+			continue // election barrier, no state change
+		}
+		c.t.Fatalf("gap in committed log at index %d (Log Matching violated)", i)
 	}
 	return st
 }
@@ -50,11 +53,13 @@ func TestBasicAgreement(t *testing.T) {
 	c := makeCluster(t, 3, 101, true)
 	defer c.cleanup()
 	c.checkOneLeader()
+	var prev uint64
 	for i := 1; i <= 5; i++ {
 		idx := c.one(kv.EncodePut("k", fmt.Sprintf("v%d", i)), c.n, true)
-		if idx != uint64(i) {
-			t.Fatalf("write %d committed at index %d, want %d", i, idx, i)
+		if prev != 0 && idx != prev+1 {
+			t.Fatalf("writes landed at non-contiguous indices: %d then %d", prev, idx)
 		}
+		prev = idx
 	}
 }
 
