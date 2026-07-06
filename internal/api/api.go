@@ -30,13 +30,16 @@ type raftNode interface {
 	Submit(command []byte) (index, term uint64, isLeader bool)
 	ReadIndex(ctx context.Context) (index uint64, ok bool)
 	LeaderID() int
+	Snapshot(index uint64, data []byte)
+	LogSize() uint64
 }
 
 // Server wraps one Raft node and its state machine.
 type Server struct {
-	id    int
-	rf    raftNode
-	store *kv.Store
+	id            int
+	rf            raftNode
+	store         *kv.Store
+	snapThreshold uint64 // compact the log once it exceeds this many bytes (0 = never)
 
 	mu           sync.Mutex
 	appliedIndex uint64
@@ -51,16 +54,18 @@ type applyResult struct {
 	term   uint64
 }
 
-// NewServer starts consuming applyCh and returns a ready server. Call Close to
-// stop it (after the underlying Raft node is killed, so nothing else writes to
-// applyCh).
-func NewServer(id int, rf raftNode, store *kv.Store, applyCh chan raft.ApplyMsg) *Server {
+// NewServer starts consuming applyCh and returns a ready server. snapThreshold is
+// the log size (bytes) past which the server compacts via Raft.Snapshot; 0
+// disables snapshotting. Call Close to stop it (after the underlying Raft node is
+// killed, so nothing else writes to applyCh).
+func NewServer(id int, rf raftNode, store *kv.Store, applyCh chan raft.ApplyMsg, snapThreshold uint64) *Server {
 	s := &Server{
-		id:      id,
-		rf:      rf,
-		store:   store,
-		waiters: make(map[uint64]chan applyResult),
-		dead:    make(chan struct{}),
+		id:            id,
+		rf:            rf,
+		store:         store,
+		snapThreshold: snapThreshold,
+		waiters:       make(map[uint64]chan applyResult),
+		dead:          make(chan struct{}),
 	}
 	s.wg.Add(1)
 	go s.applyLoop(applyCh)
@@ -106,6 +111,13 @@ func (s *Server) applyLoop(applyCh chan raft.ApplyMsg) {
 				ch <- applyResult{result: res, term: msg.Term} // buffered; never blocks
 			}
 			s.mu.Unlock()
+
+			// Compact once the log outgrows the threshold. We are the sole
+			// applier, so the store's state matches msg.Index exactly; take the
+			// snapshot outside s.mu (Raft.Snapshot fsyncs under the Raft lock).
+			if s.snapThreshold > 0 && s.rf.LogSize() > s.snapThreshold {
+				s.rf.Snapshot(msg.Index, s.store.Snapshot())
+			}
 		}
 	}
 }

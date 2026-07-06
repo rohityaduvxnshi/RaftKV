@@ -1,0 +1,23 @@
+# Prometheus scrape config for the RaftKV cluster (Phase 6).
+# Each raftkvd node exposes /metrics on :2112 (see Dockerfile EXPOSE).
+# Scaffolded during Phase 3; finalized when the observability layer lands.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: raftkv
+    static_configs:
+      # 5-node cluster; drop raft3/raft4 for the 3-node compose file.
+      - targets:
+          - raft0:2112
+          - raft1:2112
+          - raft2:2112
+          - raft3:2112
+          - raft4:2112
+    relabel_configs:
+      # Expose the service name as a `node` label for per-node dashboards.
+      - source_labels: [__address__]
+        regex: '([^:]+):.*'
+        target_label: node
+        replacement: '$1'

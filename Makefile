@@ -40,9 +40,12 @@ lint: vet
 tidy:
 	$(GO) mod tidy
 
-## proto: regenerate gRPC/protobuf code (wired up in Phase 6)
+## proto: regenerate gRPC/protobuf Go code (needs protoc + protoc-gen-go[-grpc])
 proto:
-	@echo "no .proto sources yet — added in Phase 6 (gRPC transport)"
+	protoc -I=internal/transport/grpc/proto \
+	  --go_out=internal/transport/grpc/proto --go_opt=paths=source_relative \
+	  --go-grpc_out=internal/transport/grpc/proto --go-grpc_opt=paths=source_relative \
+	  internal/transport/grpc/proto/raft.proto
 
 ## clean: remove build/test caches
 clean:

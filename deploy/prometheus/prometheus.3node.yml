@@ -1,0 +1,17 @@
+# Prometheus scrape config for the 3-node RaftKV compose file.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: raftkv
+    static_configs:
+      - targets:
+          - raft0:2112
+          - raft1:2112
+          - raft2:2112
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: '([^:]+):.*'
+        target_label: node
+        replacement: '$1'

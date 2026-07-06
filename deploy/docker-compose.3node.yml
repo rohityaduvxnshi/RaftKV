@@ -1,5 +1,60 @@
-# 3-node RaftKV cluster (tolerates 1 node failure).
+# 3-node RaftKV cluster (tolerates 1 node failure) + Prometheus + Grafana.
 #
-# Placeholder — populated in Phase 6 once the gRPC transport and server wiring
-# exist. Will define raft0/raft1/raft2 services on a shared network, each with
-# its own data volume, plus Prometheus + Grafana for observability.
+#   docker compose -f deploy/docker-compose.3node.yml up --build
+#
+# HTTP client API published on the host as 8080..8082 (write to any node — a
+# non-leader replies 307 to the leader). Grafana http://localhost:3000,
+# Prometheus http://localhost:9091.
+name: raftkv3
+
+x-node: &node
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  restart: unless-stopped
+
+x-peers: &peers "0@raft0:9090,1@raft1:9090,2@raft2:9090"
+x-apipeers: &apipeers "0@http://raft0:8080,1@http://raft1:8080,2@http://raft2:8080"
+
+services:
+  raft0:
+    <<: *node
+    command: ["-id", "0", "-peers", *peers, "-api-peers", *apipeers, "-data-dir", "/data"]
+    ports: ["8080:8080"]
+    volumes: ["raft0-data:/data"]
+  raft1:
+    <<: *node
+    command: ["-id", "1", "-peers", *peers, "-api-peers", *apipeers, "-data-dir", "/data"]
+    ports: ["8081:8080"]
+    volumes: ["raft1-data:/data"]
+  raft2:
+    <<: *node
+    command: ["-id", "2", "-peers", *peers, "-api-peers", *apipeers, "-data-dir", "/data"]
+    ports: ["8082:8080"]
+    volumes: ["raft2-data:/data"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.3node.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9091:9090"]
+    depends_on: [raft0, raft1, raft2]
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+
+volumes:
+  raft0-data: {}
+  raft1-data: {}
+  raft2-data: {}

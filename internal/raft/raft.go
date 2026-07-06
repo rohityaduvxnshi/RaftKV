@@ -231,6 +231,29 @@ func (r *Raft) LeaderID() int {
 	return r.leaderID
 }
 
+// Stats is a point-in-time snapshot of a node's state for metrics/observability.
+type Stats struct {
+	Term        uint64
+	IsLeader    bool
+	CommitIndex uint64
+	LastApplied uint64
+	LogBytes    uint64
+}
+
+// Stats returns the current node metrics.
+func (r *Raft) Stats() Stats {
+	r.mu.Lock()
+	s := Stats{
+		Term:        r.currentTerm,
+		IsLeader:    r.role == Leader,
+		CommitIndex: r.commitIndex,
+		LastApplied: r.lastApplied,
+	}
+	r.mu.Unlock()
+	s.LogBytes = r.persister.LogBytes() // takes its own lock; read off r.mu
+	return s
+}
+
 // ReadIndex returns a commit index safe to serve a linearizable read at, after
 // confirming via a heartbeat quorum that this node is still the leader. ok is
 // false if this node is not the leader, has not yet committed an entry in its

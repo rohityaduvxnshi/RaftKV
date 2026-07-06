@@ -16,8 +16,10 @@ linearizable reads, and idempotent client sessions. It follows Ongaro &
 Ousterhout's Raft paper **Figure 2** exactly; deliberate deviations are recorded
 in §3.
 
-**Current phase.** Phase 5 complete (client API, exactly-once sessions,
-linearizable reads). Next: Phase 6 (cluster deployment & observability).
+**Current phase.** Phase 6 in progress — gRPC transport, `cmd/raftkvd`, and
+Prometheus/Grafana observability are built and verified; the docker-compose
+cluster bring-up is the one acceptance still pending a Docker install (so `v0.7`
+is not tagged yet). Details in §2/§3.
 
 **High-level architecture (grown per phase):**
 
@@ -69,6 +71,34 @@ just by swapping implementations.
 ## 2. Version history
 
 Entries map 1:1 to git tags.
+
+### v0.7 (pending) — Phase 6: gRPC transport + observability (2026-07-06)
+
+**Added (built + verified without Docker):**
+- **gRPC transport** (`internal/transport/grpc`): protobuf service mirroring the
+  Figure-2 RPCs (`proto/raft.proto`, generated with a prebuilt `protoc` + the Go
+  gen plugins), a `Server` (dispatches to `raft.RPCHandler`) and a client
+  `Transport` (dials peers by ID). `TestGRPCReplication` stands up a real 3-node
+  gRPC cluster on localhost and passes the same election+replication checks as
+  the in-mem transport (3× under `-race`).
+- **`cmd/raftkvd`** fully wired: gRPC transport + bbolt persister + KV + HTTP API
+  + graceful shutdown, configured by flags (`-id -peers -http-addr -metrics-addr
+  -data-dir -api-peers -snap-bytes`). The API server now also drives log
+  compaction (`Raft.Snapshot` from the apply loop, past a byte threshold).
+- **Observability** (`internal/observability`): Prometheus metrics on `/metrics`
+  — `raftkv_current_term`/`is_leader`/`commit_index`/`last_applied`/`log_bytes`
+  gauges (from a new `Raft.Stats()`) plus HTTP request latency histogram +
+  counter (throughput, p50/p99). `docker-compose.{3,5}node.yml`, a Grafana
+  dashboard, and datasource/dashboard provisioning.
+
+**Verified:** `go test -race ./...` green; gRPC replication test; a single-node
+`raftkvd` end-to-end (HTTP PUT→204, GET→`{"value":"bar"}`, `/metrics` exposes the
+gauges + request counters). `vet` + `gofmt` clean.
+
+**Pending Docker (why v0.7 isn't tagged):** `docker compose -f
+deploy/docker-compose.5node.yml up` bringing up the live 5-node cluster and
+Grafana showing live leader/term/commit — Docker Desktop was installed but needs
+a Windows restart. Tag lands once that acceptance is verified.
 
 ### v0.6 — Phase 5: client API, exactly-once sessions, linearizable reads (2026-07-05)
 
@@ -240,6 +270,17 @@ Entries map 1:1 to git tags.
 
 ## 3. Changes (running changelog, incl. reversals & what didn't work)
 
+- **2026-07-06 — Phase 6: buf was too heavy; disk was nearly full.** Tried
+  `go install buf` for protobuf codegen — buf's dependency tree is enormous
+  (docker/cli, quic-go, wazero, cel-go, …) and the install **ran the disk out of
+  space** mid-unzip. The box was at **0.4 GB free of 220 GB** (a pre-existing
+  machine issue, not buf's alone). Dropped buf for a **prebuilt `protoc`**
+  (~3 MB, via winget) + the small `protoc-gen-go`/`protoc-gen-go-grpc` plugins.
+  After the user freed ~57 GB, codegen + the gRPC deps built fine. **The
+  Transport interface paid off exactly as designed:** the gRPC transport dropped
+  in and passed the same replication test as the in-mem one, no core changes.
+  Docker Desktop is installed but needs a Windows restart, so the docker-compose
+  cluster acceptance is deferred (see §2).
 - **2026-07-05 — Phase 5 review found a lost-wakeup race + a dedup gap.** The
   3-lens review (linearizability / exactly-once / API-concurrency) confirmed 2
   real bugs and correctly rejected 1 (a "wrong result for a retried older
@@ -371,13 +412,14 @@ exactly what is live vs. local when it lands.
 
 ## 5. Known issues / next
 
-- **Next:** Phase 6 — cluster deployment & observability. A real **gRPC
-  Transport** (protobuf; passes the same replication tests as the in-mem one),
-  `docker-compose.{3,5}node.yml`, Prometheus scraping each node, and a Grafana
-  dashboard (leader/term, `commitIndex`/`lastApplied`, throughput, p50/p99).
-  `cmd/raftkvd` gets fully wired here (it needs the gRPC transport to run a real
-  multi-process cluster). A stray `deploy/prometheus/prometheus.yml` is already
-  staged.
+- **Finish Phase 6 (needs Docker):** `docker compose -f
+  deploy/docker-compose.5node.yml up --build` → verify a working 5-node cluster
+  on the gRPC transport, Prometheus scraping all nodes, and Grafana showing live
+  leader/term/commit; then tag `v0.7`. Everything else in Phase 6 is done and
+  verified (gRPC transport, `raftkvd`, `/metrics`).
+- **Then Phase 7** — chaos & correctness: `chaos/` scripts (kill-leader,
+  partition via `tc`/`netem` + `iptables`, latency), Porcupine linearizability
+  check, load test. **Linux/WSL2 only** (netem/iptables) — see §4.
 - **§5.4.2 resolved (Phase 5).** The no-op-on-election barrier now advances
   commitIndex to cover recovered prior-term entries the moment a leader is
   elected, so re-application is immediate (no post-restart write needed). It also
@@ -386,5 +428,5 @@ exactly what is live vs. local when it lands.
 - **Deferred (noted, not blocking):** outbound RPC goroutines are fire-and-forget
   with `context.Background()`; persist-under-lock serializes the node during
   fsync (perf, not correctness). A virtual clock is also deferred.
-- CI green through Phase 2. Race detector requires the 64-bit `CC` on Windows
-  (§4).
+- CI (build + vet + `-race` on ubuntu) runs on every push. Race detector
+  requires the 64-bit `CC` on Windows locally (§4).

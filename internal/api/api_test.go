@@ -52,7 +52,7 @@ func makeAPICluster(t *testing.T, n int, seed int64) *apiCluster {
 		})
 		c.net.Register(i, rf)
 		c.rafts[i] = rf
-		c.servers[i] = api.NewServer(i, rf, store, applyCh)
+		c.servers[i] = api.NewServer(i, rf, store, applyCh, 0)
 		c.connected[i] = true
 	}
 	for i := 0; i < n; i++ {
