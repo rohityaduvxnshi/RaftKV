@@ -16,9 +16,10 @@ linearizable reads, and idempotent client sessions. It follows Ongaro &
 Ousterhout's Raft paper **Figure 2** exactly; deliberate deviations are recorded
 in §3.
 
-**Current phase.** Phase 6 complete (`v0.7`) — gRPC transport, `cmd/raftkvd`,
-Prometheus/Grafana observability, and the docker-compose cluster all built and
-verified on real Docker. Next: Phase 7 (chaos & correctness, Linux/WSL2). Details
+**Current phase.** Phase 7 complete (`v0.8`) — chaos (kill-leader, partition via
+Docker), a Porcupine linearizability check, and a load test all built and
+verified. `netem`/`tc` latency injection stays deferred to the Linux demo-
+recording box (Linux-only, per §4). Next: Phase 8 (deploy static page). Details
 in §2/§3.
 
 **High-level architecture (grown per phase):**
@@ -71,6 +72,34 @@ just by swapping implementations.
 ## 2. Version history
 
 Entries map 1:1 to git tags.
+
+### v0.8 — Phase 7: chaos & correctness (2026-07-06)
+
+**Added:**
+- **`chaos/` scripts** (Docker-native, cross-platform — no Linux tc/netem needed
+  for kill/partition): `kill-leader.sh` (kill the leader container → assert
+  re-election + a follow-up write commits) and `partition.sh` (`docker network
+  disconnect` the leader → assert the majority elects + stays writable, the
+  isolated minority serves **no** read, and the committed write survives the heal
+  — Leader Completeness, checked with a unique per-run value). `lib.sh` shares an
+  HTTP-status leader probe. Both verified against the live 5-node compose cluster.
+- **Porcupine linearizability check** (`internal/api/linearizability_test.go`):
+  a 3-node in-mem cluster driven by concurrent Append writers + linearizable Get
+  readers; the recorded history is checked against a per-key register model.
+  **210 ops across 3 keys verified linearizable, 3× under `-race`.** Exactly-once
+  sessions make the retry-on-leader-change safe, so each `(client,seq)` append
+  appears once.
+- **`cmd/loadtest`**: concurrent-PUT generator reporting throughput + client-side
+  latency percentiles.
+
+**Measured (5-node compose cluster, Docker on the Windows dev box, 16 clients,
+5 s):** **486 writes/s, 0 failures**, p50 **32 ms**, p99 **53 ms**, p99.9 71 ms.
+The ~32 ms p50 is HTTP + a Raft round-trip + **bbolt fsync on the commit path**
+(durability, not latency-optimized). `go test -race ./...` green; vet + gofmt
+clean.
+
+**Deferred:** `netem`/`tc` latency injection — Linux-only, recorded on the Linux
+demo box (§4), not this Windows host. See §3 for the election-storm observation.
 
 ### v0.7 — Phase 6: gRPC transport + observability (2026-07-06)
 
@@ -272,6 +301,26 @@ dashboard + Prometheus datasource. One fix was needed (see §3, volume perms).
 
 ## 3. Changes (running changelog, incl. reversals & what didn't work)
 
+- **2026-07-06 — Phase 7: an election storm under repeated chaos on Windows-
+  Docker (environmental, not a core bug).** After many back-to-back chaos cycles
+  (kill + `docker network disconnect`/`connect`), the live cluster fell into a
+  perpetual election storm — term climbing ~6–7×/s, no stable leader, so writes
+  503'd. It **survived a `docker compose restart`** (persisted high term reloads
+  and keeps storming) but a **fresh `down -v` + `up` was instantly stable at term
+  1**. So the trigger is accumulated churn colliding with Docker-on-Windows
+  heartbeat-latency spikes vs. the 150–300 ms election timeout (split-vote
+  livelock), not a normal-operation defect — the same core is stable at term 1
+  every fresh start and passed all deterministic in-mem chaos tests. Honest
+  caveats: (1) the load test needs a *fresh* cluster; (2) on a latency-spiky host
+  the election timeout is marginal — a future lever is scaling it up (or adding
+  Pre-Vote) for high-latency deployments. Not chased further on this box.
+- **2026-07-06 — Phase 7: exactly-once caught my own chaos test.** `partition.sh`
+  first "failed" because both chaos scripts reused client id `chaos`, so the
+  second script's `seq 1` write was **correctly deduped** against the first's —
+  the store's exactly-once working as designed, not a bug. Fixed by giving each
+  script (and each run, via `$$`) its own session. The lesson: a weak assertion
+  hid it — the original partition PASS didn't actually check the value survived;
+  strengthened to verify a unique per-run value round-trips through the heal.
 - **2026-07-06 — Phase 6 compose: distroless nonroot vs. root-owned volume.**
   First `docker compose up` crash-looped all 5 nodes: `bolt: open /data/raft-0.db:
   permission denied`. The distroless `:nonroot` user (uid 65532) can't write to a
@@ -423,10 +472,12 @@ exactly what is live vs. local when it lands.
 
 ## 5. Known issues / next
 
-- **Phase 7 (next)** — chaos & correctness: `chaos/` scripts (kill-leader,
-  partition via `tc`/`netem` + `iptables`, latency), Porcupine linearizability
-  check, load test. **Linux/WSL2 only** (netem/iptables) — see §4. The
-  docker-compose cluster it targets is now verified working (Phase 6).
+- **Phase 8 (next)** — deploy the static project page to `raftkv.dash-board.in`
+  (demo video, benchmark table incl. the §2 v0.8 numbers, Grafana screenshots,
+  safety-invariant summary, GitHub link); finalize README. See §4 for the
+  Windows-VPS constraint (static page only; live cluster + chaos video on Linux).
+- **Deferred to the Linux demo box:** `netem`/`tc` latency-injection chaos and the
+  recorded chaos/linearizability demo video (Linux-only, §4).
 - **§5.4.2 resolved (Phase 5).** The no-op-on-election barrier now advances
   commitIndex to cover recovered prior-term entries the moment a leader is
   elected, so re-application is immediate (no post-restart write needed). It also
