@@ -16,10 +16,10 @@ linearizable reads, and idempotent client sessions. It follows Ongaro &
 Ousterhout's Raft paper **Figure 2** exactly; deliberate deviations are recorded
 in §3.
 
-**Current phase.** Phase 6 in progress — gRPC transport, `cmd/raftkvd`, and
-Prometheus/Grafana observability are built and verified; the docker-compose
-cluster bring-up is the one acceptance still pending a Docker install (so `v0.7`
-is not tagged yet). Details in §2/§3.
+**Current phase.** Phase 6 complete (`v0.7`) — gRPC transport, `cmd/raftkvd`,
+Prometheus/Grafana observability, and the docker-compose cluster all built and
+verified on real Docker. Next: Phase 7 (chaos & correctness, Linux/WSL2). Details
+in §2/§3.
 
 **High-level architecture (grown per phase):**
 
@@ -72,7 +72,7 @@ just by swapping implementations.
 
 Entries map 1:1 to git tags.
 
-### v0.7 (pending) — Phase 6: gRPC transport + observability (2026-07-06)
+### v0.7 — Phase 6: gRPC transport + observability (2026-07-06)
 
 **Added (built + verified without Docker):**
 - **gRPC transport** (`internal/transport/grpc`): protobuf service mirroring the
@@ -95,10 +95,12 @@ Entries map 1:1 to git tags.
 `raftkvd` end-to-end (HTTP PUT→204, GET→`{"value":"bar"}`, `/metrics` exposes the
 gauges + request counters). `vet` + `gofmt` clean.
 
-**Pending Docker (why v0.7 isn't tagged):** `docker compose -f
-deploy/docker-compose.5node.yml up` bringing up the live 5-node cluster and
-Grafana showing live leader/term/commit — Docker Desktop was installed but needs
-a Windows restart. Tag lands once that acceptance is verified.
+**Verified on Docker (acceptance):** `docker compose -f
+deploy/docker-compose.5node.yml up --build` — 5 containers elect exactly one
+leader (`sum(raftkv_is_leader)==1`), Prometheus scrapes all 5 (`up==1`), a write
+to the leader commits and `raftkv_commit_index` converges to the same value on
+all 5 nodes, GET reads it back, and Grafana auto-provisions the "RaftKV Cluster"
+dashboard + Prometheus datasource. One fix was needed (see §3, volume perms).
 
 ### v0.6 — Phase 5: client API, exactly-once sessions, linearizable reads (2026-07-05)
 
@@ -270,6 +272,15 @@ a Windows restart. Tag lands once that acceptance is verified.
 
 ## 3. Changes (running changelog, incl. reversals & what didn't work)
 
+- **2026-07-06 — Phase 6 compose: distroless nonroot vs. root-owned volume.**
+  First `docker compose up` crash-looped all 5 nodes: `bolt: open /data/raft-0.db:
+  permission denied`. The distroless `:nonroot` user (uid 65532) can't write to a
+  named volume, whose mountpoint Docker creates root-owned. Fix (kept nonroot,
+  didn't fall back to `user: root`): `mkdir /data` in the build stage and
+  `COPY --chown=65532:65532` it into the final image, so a *fresh* empty volume
+  inherits nonroot ownership (Docker seeds an empty volume from the image dir's
+  perms). Needed `down -v` to discard the already root-owned volumes. Then the
+  acceptance passed (see §2).
 - **2026-07-06 — Phase 6: buf was too heavy; disk was nearly full.** Tried
   `go install buf` for protobuf codegen — buf's dependency tree is enormous
   (docker/cli, quic-go, wazero, cel-go, …) and the install **ran the disk out of
@@ -412,14 +423,10 @@ exactly what is live vs. local when it lands.
 
 ## 5. Known issues / next
 
-- **Finish Phase 6 (needs Docker):** `docker compose -f
-  deploy/docker-compose.5node.yml up --build` → verify a working 5-node cluster
-  on the gRPC transport, Prometheus scraping all nodes, and Grafana showing live
-  leader/term/commit; then tag `v0.7`. Everything else in Phase 6 is done and
-  verified (gRPC transport, `raftkvd`, `/metrics`).
-- **Then Phase 7** — chaos & correctness: `chaos/` scripts (kill-leader,
+- **Phase 7 (next)** — chaos & correctness: `chaos/` scripts (kill-leader,
   partition via `tc`/`netem` + `iptables`, latency), Porcupine linearizability
-  check, load test. **Linux/WSL2 only** (netem/iptables) — see §4.
+  check, load test. **Linux/WSL2 only** (netem/iptables) — see §4. The
+  docker-compose cluster it targets is now verified working (Phase 6).
 - **§5.4.2 resolved (Phase 5).** The no-op-on-election barrier now advances
   commitIndex to cover recovered prior-term entries the moment a leader is
   elected, so re-application is immediate (no post-restart write needed). It also
