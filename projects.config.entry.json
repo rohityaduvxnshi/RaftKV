@@ -1,0 +1,11 @@
+{
+  "_comment": "Merge this entry into the dash-board.in portfolio registry, matching the existing entries' exact schema/field names before committing.",
+  "title": "RaftKV",
+  "subdomain": "raftkv.dash-board.in",
+  "repo": "c:/GitHub/RaftKV",
+  "liveUrl": "https://raftkv.dash-board.in",
+  "backend": "static (project page); cluster runs via docker compose",
+  "stack": ["go", "raft", "grpc", "bbolt", "prometheus", "grafana", "docker"],
+  "status": "complete",
+  "description": "Replicated, strongly-consistent key-value store with the Raft consensus protocol implemented from scratch in Go: leader election, log replication, crash-safe persistence, snapshots, linearizable reads, exactly-once sessions. Verified with deterministic fault injection, Porcupine linearizability checking, and live chaos testing."
+}

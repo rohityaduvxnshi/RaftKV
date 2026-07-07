@@ -16,11 +16,14 @@ linearizable reads, and idempotent client sessions. It follows Ongaro &
 Ousterhout's Raft paper **Figure 2** exactly; deliberate deviations are recorded
 in §3.
 
-**Current phase.** Phase 7 complete (`v0.8`) — chaos (kill-leader, partition via
-Docker), a Porcupine linearizability check, and a load test all built and
-verified. `netem`/`tc` latency injection stays deferred to the Linux demo-
-recording box (Linux-only, per §4). Next: Phase 8 (deploy static page). Details
-in §2/§3.
+**Current phase.** Phase 8 in progress — the full documentation set (README,
+docs/{architecture,raft,api,operations,testing}.md, CHANGELOG, CONTRIBUTING,
+MIT LICENSE) is written and fact-checked, and the static project page is
+deployed to the VPS with the Caddy site block live (verified routing via forced
+resolution). **Blocked on one user action:** a GoDaddy A record
+`raftkv` → `144.172.98.43` (no wildcard exists; each subdomain has its own
+record). Once DNS resolves: verify live, drop the README "not yet live" note,
+tag `v0.9`. The demo video stays deferred to the Linux box (§4).
 
 **High-level architecture (grown per phase):**
 
@@ -457,8 +460,15 @@ cluster is NOT hosted on the Windows VPS.** Plan:
 - **Optional live cluster:** if a live endpoint is wanted, deploy to a Linux
   host (e.g. Oracle Cloud Always Free) and link it from the page.
 
-**Status:** not yet deployed (Phase 8). This section will be updated to state
-exactly what is live vs. local when it lands.
+**Status (2026-07-07):** site content deployed to `C:\dashboard\sites\raftkv`
+on the VPS; Caddy site block added + reloaded and verified routing (a
+forced-resolution `curl` gets the 308→https redirect). **Waiting only on the
+GoDaddy A record `raftkv` → `144.172.98.43`** — the CollabCanvas runbook's
+claim of a `*` wildcard record is outdated; subdomains have explicit A records.
+Auto-HTTPS (ACME) completes on its own once DNS resolves — no VPS action
+needed. Redeploy = `./deploy/deploy-site.ps1` (zip → scp → Expand-Archive →
+Caddy block if missing). A `projects.config.entry.json` template is staged for
+the portfolio registry merge.
 
 **Local dev toolchain (Windows 11 dev box):**
 - Go 1.26.4 → `%LOCALAPPDATA%\Programs\go` (User `GOROOT` + PATH).
@@ -472,10 +482,12 @@ exactly what is live vs. local when it lands.
 
 ## 5. Known issues / next
 
-- **Phase 8 (next)** — deploy the static project page to `raftkv.dash-board.in`
-  (demo video, benchmark table incl. the §2 v0.8 numbers, Grafana screenshots,
-  safety-invariant summary, GitHub link); finalize README. See §4 for the
-  Windows-VPS constraint (static page only; live cluster + chaos video on Linux).
+- **Phase 8 (in progress)** — docs complete (8 files, adversarially
+  fact-checked: ~660 claims verified, 14 defects fixed); site deployed to the
+  VPS + Caddy verified. **Remaining:** (1) user adds the GoDaddy A record
+  `raftkv → 144.172.98.43`; (2) verify `https://raftkv.dash-board.in` live;
+  (3) remove the README "not yet live" note; (4) tag `v0.9`; (5) optionally
+  merge `projects.config.entry.json` into the portfolio registry.
 - **Deferred to the Linux demo box:** `netem`/`tc` latency-injection chaos and the
   recorded chaos/linearizability demo video (Linux-only, §4).
 - **§5.4.2 resolved (Phase 5).** The no-op-on-election barrier now advances

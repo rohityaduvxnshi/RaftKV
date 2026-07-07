@@ -1,0 +1,495 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RaftKV — Raft consensus from scratch in Go</title>
+<meta name="description" content="RaftKV is a replicated, strongly consistent key-value store: the Raft consensus protocol implemented from scratch in Go, with verified safety properties, chaos testing, and a Porcupine linearizability check.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230e1116'/%3E%3Ccircle cx='16' cy='9' r='4' fill='%23e8a33d'/%3E%3Ccircle cx='9' cy='22' r='4' fill='%235b6472'/%3E%3Ccircle cx='23' cy='22' r='4' fill='%235b6472'/%3E%3Cpath d='M16 9 9 22M16 9l7 13' stroke='%232a3240' stroke-width='1.5'/%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #0e1116;
+  --panel: #151a21;
+  --panel-2: #11151c;
+  --line: #252c36;
+  --ink: #d6dbe3;
+  --muted: #8b94a3;
+  --faint: #5b6472;
+  --accent: #e8a33d;
+  --accent-dim: #a97524;
+  --mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, Menlo, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 16.5px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+::selection { background: var(--accent); color: #14100a; }
+a { color: var(--ink); text-decoration-color: var(--faint); text-underline-offset: 3px; }
+a:hover { color: var(--accent); text-decoration-color: var(--accent-dim); }
+a:focus-visible, .btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+code, .mono {
+  font-family: var(--mono);
+  font-size: 0.88em;
+}
+code {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  white-space: nowrap;
+}
+.wrap { max-width: 900px; margin: 0 auto; padding: 0 24px; }
+section { padding: 72px 0 8px; }
+
+/* ---- eyebrow: reads like a code comment ---- */
+.eyebrow {
+  font-family: var(--mono);
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin-bottom: 14px;
+}
+.eyebrow::before { content: "// "; color: var(--accent); }
+h2 {
+  font-size: clamp(24px, 3.5vw, 30px);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin-bottom: 20px;
+}
+h3 { font-size: 18px; font-weight: 650; margin: 26px 0 8px; }
+p { color: var(--muted); max-width: 68ch; }
+p strong { color: var(--ink); font-weight: 600; }
+p + p { margin-top: 14px; }
+
+/* ---- hero ---- */
+header { padding: 96px 0 56px; border-bottom: 1px solid var(--line); }
+.badge {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--accent);
+  border: 1px solid var(--accent-dim);
+  border-radius: 999px;
+  padding: 2px 12px;
+  margin-bottom: 22px;
+}
+.badge span { color: var(--muted); }
+h1 {
+  font-size: clamp(46px, 9vw, 76px);
+  font-weight: 800;
+  letter-spacing: -0.035em;
+  line-height: 1.05;
+}
+h1 .kv { color: var(--accent); }
+.tagline {
+  margin-top: 18px;
+  font-size: clamp(17px, 2.4vw, 20px);
+  color: var(--ink);
+  max-width: 34em;
+}
+.subline { margin-top: 12px; font-size: 15.5px; }
+.cta { margin-top: 32px; display: flex; gap: 14px; flex-wrap: wrap; }
+.btn {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 15px;
+  font-weight: 600;
+  text-decoration: none;
+  border-radius: 6px;
+  padding: 11px 22px;
+  border: 1px solid var(--accent-dim);
+}
+.btn-solid { background: var(--accent); color: #14100a; }
+.btn-solid:hover { background: #f0b35a; color: #14100a; }
+.btn-ghost { color: var(--accent); background: transparent; }
+.btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ---- numbers strip ---- */
+.stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  margin-top: 56px;
+  background: var(--panel-2);
+}
+.stat { padding: 22px 20px 18px; border-left: 1px solid var(--line); }
+.stat:first-child { border-left: none; }
+.stat .n {
+  font-family: var(--mono);
+  font-size: clamp(22px, 3vw, 28px);
+  font-weight: 700;
+  color: var(--ink);
+  letter-spacing: -0.02em;
+}
+.stat .n em { font-style: normal; color: var(--accent); }
+.stat .l { font-size: 13px; color: var(--muted); margin-top: 4px; line-height: 1.45; }
+@media (max-width: 720px) {
+  .stats { grid-template-columns: 1fr 1fr; }
+  .stat { border-top: 1px solid var(--line); }
+  .stat:nth-child(-n+2) { border-top: none; }
+  .stat:nth-child(odd) { border-left: none; }
+}
+
+/* ---- architecture ---- */
+.diagram {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-2);
+  padding: 20px 12px 8px;
+  margin-top: 26px;
+  overflow-x: auto;
+}
+.diagram svg { display: block; min-width: 620px; width: 100%; height: auto; margin: 0 auto; max-width: 760px; }
+.caption { font-size: 14px; color: var(--faint); margin: 12px 4px 12px; font-family: var(--mono); }
+
+/* ---- tables ---- */
+.tablewrap { overflow-x: auto; margin-top: 26px; border: 1px solid var(--line); border-radius: 10px; }
+table { border-collapse: collapse; width: 100%; min-width: 560px; background: var(--panel-2); }
+th, td { text-align: left; padding: 13px 18px; border-top: 1px solid var(--line); vertical-align: top; }
+th {
+  border-top: none;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+td { font-size: 15px; color: var(--muted); }
+td:first-child { color: var(--ink); font-weight: 600; white-space: nowrap; }
+td code { white-space: nowrap; }
+.num { font-family: var(--mono); color: var(--ink); white-space: nowrap; }
+
+/* ---- chaos ---- */
+.chaos-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 26px; }
+@media (max-width: 720px) { .chaos-grid { grid-template-columns: 1fr; } }
+.card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-2);
+  padding: 20px 22px;
+}
+.card h3 { margin: 0 0 8px; font-family: var(--mono); font-size: 15.5px; color: var(--accent); }
+.card p { font-size: 14.5px; }
+.pass {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--accent);
+  border: 1px solid var(--accent-dim);
+  border-radius: 4px;
+  padding: 1px 8px;
+  margin-bottom: 12px;
+}
+.honest {
+  margin-top: 22px;
+  border-left: 3px solid var(--accent-dim);
+  padding: 4px 0 4px 18px;
+}
+.honest p { font-size: 15px; }
+.video-slot {
+  margin-top: 22px;
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  padding: 34px 22px;
+  text-align: center;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 14px;
+}
+
+/* ---- footer ---- */
+footer {
+  margin-top: 88px;
+  border-top: 1px solid var(--line);
+  padding: 34px 0 48px;
+  font-size: 14.5px;
+  color: var(--faint);
+}
+footer .row { display: flex; gap: 10px 28px; flex-wrap: wrap; }
+footer a { color: var(--muted); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="badge">v0.8 <span>&middot; Go 1.26 &middot; MIT</span></div>
+    <h1>Raft<span class="kv">KV</span></h1>
+    <p class="tagline">A replicated, strongly consistent key-value store.
+    The Raft consensus protocol, implemented from scratch in Go &mdash; no
+    consensus libraries.</p>
+    <p class="subline">Leader election &middot; log replication &middot;
+    crash-safe persistence &middot; snapshotting &middot; linearizable reads
+    &middot; exactly-once client sessions.</p>
+    <div class="cta">
+      <a class="btn btn-solid" href="https://github.com/rohityaduvxnshi/RaftKV">GitHub repo</a>
+      <a class="btn btn-ghost" href="https://github.com/rohityaduvxnshi/RaftKV#documentation">Documentation</a>
+    </div>
+
+    <div class="stats">
+      <div class="stat">
+        <div class="n"><em>486</em> writes/s</div>
+        <div class="l">sustained, zero failures, fsync on every commit</div>
+      </div>
+      <div class="stat">
+        <div class="n">32 / 53 ms</div>
+        <div class="l">p50 / p99 write latency, 16 concurrent clients</div>
+      </div>
+      <div class="stat">
+        <div class="n"><em>210</em> ops</div>
+        <div class="l">verified linearizable with Porcupine, 3 runs under <span class="mono">-race</span></div>
+      </div>
+      <div class="stat">
+        <div class="n">5 nodes</div>
+        <div class="l">docker-compose cluster; tolerates 2 node failures</div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<section id="what">
+  <div class="wrap">
+    <div class="eyebrow">what &amp; why</div>
+    <h2>Consensus, built from the paper up</h2>
+    <p>RaftKV implements Raft directly from Ongaro &amp; Ousterhout&rsquo;s
+    Figure&nbsp;2 &mdash; no <code>hashicorp/raft</code>, no
+    <code>etcd/raft</code>. Leader election with randomized timeouts, log
+    replication with fast conflict backup, a bbolt write-ahead log that fsyncs
+    on the commit path, snapshot-based log compaction with
+    <code>InstallSnapshot</code> catch-up, ReadIndex linearizable reads, and
+    exactly-once client sessions that survive compaction. Every deviation a real
+    system forces is deliberate and documented.</p>
+    <p>The design hinges on one seam: <strong>the Raft core depends on exactly
+    two interfaces</strong>, <code>Transport</code> and <code>Persister</code>.
+    Swap in the in-memory implementations and the same core runs under a
+    deterministic, seedable adversarial network &mdash; dropped, delayed,
+    reordered, partitioned messages that reproduce exactly. Swap in gRPC and
+    bbolt and the identical core runs a real cluster &mdash;
+    <code>TestGRPCReplication</code> passes the same election and replication
+    checks over real gRPC, and the five-node docker-compose deployment runs the
+    same binary. The tests and the deployment exercise one implementation, not
+    two.</p>
+  </div>
+</section>
+
+<section id="architecture">
+  <div class="wrap">
+    <div class="eyebrow">architecture</div>
+    <h2>One core, two seams</h2>
+    <div class="diagram">
+      <svg viewBox="0 0 680 396" role="img" aria-label="Architecture diagram: client to HTTP API to Raft core to KV state machine, with the Raft core depending on the Transport interface (inmem or gRPC) and the Persister interface (in-memory or bbolt)">
+        <defs>
+          <marker id="arr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0 0 L8 4 L0 8 z" fill="#8b94a3"/>
+          </marker>
+        </defs>
+        <style>
+          .box { fill: #151a21; stroke: #2a3240; stroke-width: 1.2; rx: 6; }
+          .ibox { fill: #0e1116; stroke: #2a3240; stroke-width: 1; rx: 5; }
+          .core { stroke: #a97524; stroke-width: 1.4; }
+          .t { fill: #d6dbe3; font: 600 14px system-ui, sans-serif; text-anchor: middle; }
+          .m { fill: #8b94a3; font: 12px ui-monospace, Consolas, monospace; text-anchor: middle; }
+          .seam { fill: #e8a33d; font: 600 12px ui-monospace, Consolas, monospace; text-anchor: middle; letter-spacing: 0.06em; }
+          .flow { stroke: #8b94a3; stroke-width: 1.3; fill: none; marker-end: url(#arr); }
+          .dep { stroke: #a97524; stroke-width: 1.2; stroke-dasharray: 5 4; fill: none; }
+          .grp { fill: none; stroke: #a97524; stroke-width: 1; stroke-dasharray: 5 4; rx: 8; }
+        </style>
+
+        <!-- top row -->
+        <rect class="box" x="14" y="44" width="98" height="52" rx="6"/>
+        <text class="t" x="63" y="75">Client</text>
+
+        <rect class="box" x="152" y="44" width="122" height="52" rx="6"/>
+        <text class="t" x="213" y="69">HTTP API</text>
+        <text class="m" x="213" y="86">redirect / retry</text>
+
+        <rect class="box core" x="314" y="44" width="128" height="52" rx="6"/>
+        <text class="t" x="378" y="69">Raft core</text>
+        <text class="m" x="378" y="86">internal/raft</text>
+
+        <rect class="box" x="482" y="44" width="184" height="52" rx="6"/>
+        <text class="t" x="574" y="69">KV state machine</text>
+        <text class="m" x="574" y="86">get put del cas append</text>
+
+        <line class="flow" x1="112" y1="70" x2="148" y2="70"/>
+        <text class="m" x="130" y="60">HTTP</text>
+        <line class="flow" x1="274" y1="70" x2="310" y2="70"/>
+        <line class="flow" x1="442" y1="70" x2="478" y2="70"/>
+        <text class="m" x="460" y="60">apply</text>
+
+        <!-- seams from the core -->
+        <path class="dep" d="M 352 96 V 158 H 190 V 200"/>
+        <path class="dep" d="M 404 96 V 158 H 522 V 200"/>
+
+        <!-- Transport group -->
+        <rect class="grp" x="56" y="204" width="268" height="160" rx="8"/>
+        <text class="seam" x="190" y="230">Transport interface</text>
+        <rect class="ibox" x="74" y="248" width="232" height="44" rx="5"/>
+        <text class="t" x="190" y="267" style="font-size:13px">inmem</text>
+        <text class="m" x="190" y="284">seeded drop / delay / partition</text>
+        <rect class="ibox" x="74" y="302" width="232" height="44" rx="5"/>
+        <text class="t" x="190" y="321" style="font-size:13px">gRPC</text>
+        <text class="m" x="190" y="338">real cluster, protobuf RPCs</text>
+
+        <!-- Persister group -->
+        <rect class="grp" x="388" y="204" width="268" height="160" rx="8"/>
+        <text class="seam" x="522" y="230">Persister interface</text>
+        <rect class="ibox" x="406" y="248" width="232" height="44" rx="5"/>
+        <text class="t" x="522" y="267" style="font-size:13px">MemPersister</text>
+        <text class="m" x="522" y="284">deterministic tests</text>
+        <rect class="ibox" x="406" y="302" width="232" height="44" rx="5"/>
+        <text class="t" x="522" y="321" style="font-size:13px">bbolt</text>
+        <text class="m" x="522" y="338">WAL, fsync on commit</text>
+
+        <text class="m" x="340" y="388">same core &mdash; adversarial in-process tests and the live gRPC cluster</text>
+      </svg>
+    </div>
+    <p class="caption">Log indices are 1-based; the entry at index 0 is the
+    snapshot boundary sentinel.</p>
+  </div>
+</section>
+
+<section id="safety">
+  <div class="wrap">
+    <div class="eyebrow">verified safety properties</div>
+    <h2>Every claim has a test attached</h2>
+    <p>The Raft paper&rsquo;s safety properties are not assumed &mdash; each one
+    is asserted by a named oracle, test, or chaos script. All tests run under
+    the Go race detector in CI.</p>
+    <div class="tablewrap">
+      <table>
+        <tr><th>Property</th><th>Guarantee</th><th>Verified by</th></tr>
+        <tr>
+          <td>Election Safety</td>
+          <td>At most one leader per term.</td>
+          <td><code>checkOneLeader</code> oracle, asserted across the election
+          suite including <code>TestReElection</code> and
+          <code>TestElectionUnreliable</code> (~10% message loss, delays).</td>
+        </tr>
+        <tr>
+          <td>Log Matching</td>
+          <td>Nodes agree on committed entries; no gaps in the log.</td>
+          <td>Gap and agreement checks in the replication suite
+          (<code>TestLeaderChangeKeepsCommitted</code>,
+          <code>TestDeposedLeaderEntriesOverwritten</code>).</td>
+        </tr>
+        <tr>
+          <td>State Machine Safety</td>
+          <td>No two nodes apply different commands at the same log index.</td>
+          <td>Per-index oracle in every harness apply drain, plus
+          <code>checkStoresAgree</code> across command and snapshot applies.</td>
+        </tr>
+        <tr>
+          <td>Leader Completeness</td>
+          <td>Committed entries survive leader changes and partitions.</td>
+          <td><code>chaos/partition.sh</code>: a unique per-run committed value
+          survives partition and heal on the live 5-node cluster.</td>
+        </tr>
+        <tr>
+          <td>Linearizability</td>
+          <td>Every operation appears atomic between call and return.</td>
+          <td><code>TestLinearizability</code>: Porcupine per-key register
+          model, 210 concurrent ops across 3 keys, 3 runs under
+          <code>-race</code>.</td>
+        </tr>
+        <tr>
+          <td>Exactly-once</td>
+          <td>A retried write applies once, even across leader changes.</td>
+          <td><code>TestExactlyOnceRetry</code>, <code>TestZeroSeqDedup</code>;
+          the session table is snapshotted, so dedup survives compaction.</td>
+        </tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section id="chaos">
+  <div class="wrap">
+    <div class="eyebrow">chaos, honestly</div>
+    <h2>Fault injection against the live cluster</h2>
+    <p>Two Docker-native chaos scripts run against the real 5-node
+    docker-compose cluster &mdash; not a simulation. Both pass, with
+    assertions on data, not just liveness.</p>
+    <div class="chaos-grid">
+      <div class="card">
+        <span class="pass">PASS</span>
+        <h3>chaos/kill-leader.sh</h3>
+        <p>Kills the leader container. Asserts the cluster re-elects and a
+        follow-up write commits through the new leader, then restarts the
+        killed node.</p>
+      </div>
+      <div class="card">
+        <span class="pass">PASS</span>
+        <h3>chaos/partition.sh</h3>
+        <p>Disconnects the leader from the cluster network. Asserts the
+        majority elects a new leader and stays writable, the isolated minority
+        refuses reads (no quorum, so no stale read), and a unique committed
+        value survives the heal.</p>
+      </div>
+    </div>
+    <div class="honest">
+      <p><strong>Found honestly:</strong> after many back-to-back chaos cycles
+      on Docker-for-Windows, accumulated churn plus host latency spikes pushed
+      heartbeats past the 150&ndash;300&nbsp;ms election timeout and the
+      cluster fell into a split-vote election storm &mdash; a fresh cluster is
+      stable at term&nbsp;1 every time. The lesson: on latency-spiky hosts the
+      election timeout is marginal; scaling it up (or adding Pre-Vote) is the
+      lever for high-latency deployments.</p>
+    </div>
+    <div class="video-slot">demo video coming soon &mdash; chaos run recorded
+    on a Linux box (tc/netem latency injection is Linux-only)</div>
+  </div>
+</section>
+
+<section id="benchmark">
+  <div class="wrap">
+    <div class="eyebrow">benchmark</div>
+    <h2>Throughput with durability on</h2>
+    <div class="tablewrap">
+      <table>
+        <tr><th>Metric</th><th>Value</th></tr>
+        <tr><td>Write throughput</td><td class="num">486 writes/s</td></tr>
+        <tr><td>Failed requests</td><td class="num">0</td></tr>
+        <tr><td>Latency p50</td><td class="num">32 ms</td></tr>
+        <tr><td>Latency p99</td><td class="num">53 ms</td></tr>
+        <tr><td>Latency p99.9</td><td class="num">71 ms</td></tr>
+      </table>
+    </div>
+    <p style="margin-top:16px; font-size:15px">Measured with
+    <code>cmd/loadtest</code>: 5-node docker-compose cluster on a Windows dev
+    box, 16 concurrent clients, 5&nbsp;s of sustained PUTs. Every write pays an
+    HTTP round-trip, a Raft replication round, and a <strong>bbolt fsync on
+    the commit path</strong> &mdash; this build is tuned for durability, not
+    latency.</p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="row">
+      <a href="https://github.com/rohityaduvxnshi/RaftKV">github.com/rohityaduvxnshi/RaftKV</a>
+      <span>MIT licensed</span>
+      <a href="https://raft.github.io/raft.pdf">Raft: Ongaro &amp; Ousterhout</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

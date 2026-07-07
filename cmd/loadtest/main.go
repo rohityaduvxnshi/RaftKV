@@ -1,7 +1,8 @@
 // Command loadtest fires concurrent PUTs at a RaftKV node's HTTP API and reports
 // write throughput and client-side latency percentiles. Point -addr at the
 // current leader (a follower 307-redirects to container hostnames the host can't
-// resolve). Find it with: chaos/lib.sh find_leader, or probe /kv/_probe for 200.
+// resolve). Find it with: chaos/lib.sh find_leader, or probe /kv/_probe for a
+// non-307 answer (the leader returns 200/404).
 package main
 
 import (
